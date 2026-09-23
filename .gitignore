@@ -1,0 +1,11 @@
+*.o
+*.so
+
+/test_va_dec
+/test_va_dec_gpu
+/test_va_enc
+/test_va_prime
+/test_va_replica
+/test_va_rgb_chain
+/test_va_sunshine
+/test_va_vpp
