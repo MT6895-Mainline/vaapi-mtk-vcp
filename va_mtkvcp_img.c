@@ -632,16 +632,28 @@ VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
      * with WRITE_ONLY | SEPARATE_LAYERS (it renders into them through EGL),
      * which is how Sunshine's VA-API encoder and any other libavcodec-based
      * client hit this path. */
-    if (si < 0 || si >= MTKVCP_MAX_SURFACES)
+    if (si < 0 || si >= MTKVCP_MAX_SURFACES) {
+        mtkvcp_log("ExportSurfaceHandle rejected: si=%d out of range", si);
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
     pthread_mutex_lock(&d->lock);
     if (!d->surfaces[si].in_use ||
         (d->surfaces[si].kind != MTKVCP_SURF_DECODE &&
-         d->surfaces[si].kind != MTKVCP_SURF_UNBOUND)) {
+         d->surfaces[si].kind != MTKVCP_SURF_UNBOUND &&
+         d->surfaces[si].kind != MTKVCP_SURF_ENC_INPUT)) {
+        mtkvcp_log("ExportSurfaceHandle rejected: si=%d in_use=%d kind=%d ctx=%d "
+                   "prime_fd=%d flags=%#x", si,
+                   d->surfaces[si].in_use, d->surfaces[si].kind,
+                   d->surfaces[si].ctx, d->surfaces[si].prime_fd, flags);
         pthread_mutex_unlock(&d->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-    if (d->surfaces[si].kind == MTKVCP_SURF_UNBOUND) {
+    /* UNBOUND is the storage a client exports to render into; ENC_INPUT is
+     * that very same storage once BeginPicture has bound it. FFmpeg's texture
+     * encoder (OBS's ffmpeg_vaapi_tex) re-exports a surface after it has been
+     * used, so both kinds must hand back the same dma-buf. */
+    if (d->surfaces[si].kind == MTKVCP_SURF_UNBOUND ||
+        d->surfaces[si].kind == MTKVCP_SURF_ENC_INPUT) {
         if (d->surfaces[si].prime_fd < 0 &&
             mtkvcp_export_unbound(&d->surfaces[si]) < 0) {
             pthread_mutex_unlock(&d->lock);
