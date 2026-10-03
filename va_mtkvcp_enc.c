@@ -23,6 +23,11 @@
 #define ENC_OUT_TYPE V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
 #define ENC_CAP_TYPE V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
 #define V4L2_CID_MPEG_MTK_PADDED_NV12_CHROMA (V4L2_CTRL_CLASS_CODEC | 0x20f0)
+/* Vendor V4L2_CID_MPEG_MTK_ENCODE_OPERATION_RATE (MTK_BASE+24). The firmware
+ * wedges on the S_PARM frame rate at >= 120 fps, so the client's real rate is
+ * handed over through this separate parameter instead.
+ */
+#define V4L2_CID_MPEG_MTK_OPERATION_RATE (V4L2_CTRL_CLASS_CODEC | 0x2018)
 
 int mtkvcp_padded_uv_enabled(void)
 {
@@ -683,6 +688,22 @@ static VAStatus mtkvcp_enc_apply_params(struct mtkvcp_context *c)
             c->enc_applied_fps_den = fps_den;
         }
     }
+    /* The real client rate travels in the vendor operation-rate parameter;
+     * frm_rate itself stays clamped. Set it before the first CONFIG so the
+     * firmware's config block carries it.
+     */
+    if (c->enc_operation_rate &&
+        c->enc_operation_rate != c->enc_applied_op_rate) {
+        r = mtkvcp_s_ctrl(c->vfd, V4L2_CID_MPEG_MTK_OPERATION_RATE,
+                          (int32_t)c->enc_operation_rate);
+        if (r < 0) {
+            mtkvcp_log("enc OPERATION_RATE=%u refused errno=%d",
+                       c->enc_operation_rate, -r);
+        } else {
+            c->enc_applied_op_rate = c->enc_operation_rate;
+            mtkvcp_log("enc operation rate %u", c->enc_operation_rate);
+        }
+    }
     c->enc_params_dirty = 0;
     return failed ? VA_STATUS_ERROR_OPERATION_FAILED : VA_STATUS_SUCCESS;
 }
@@ -757,6 +778,15 @@ VAStatus mtkvcp_enc_render(struct mtkvcp_drv *d, int ci, int bi)
                     c->enc_framerate_num = 119;
                     c->enc_framerate_den = 1;
                 }
+                /* The firmware also accepts the client's real rate through a
+                 * separate operation-rate parameter, but it is held to the
+                 * same 119/1 ceiling: at 120+ the firmware additionally stops
+                 * emitting the in-band SPS/PPS, which leaves the stream
+                 * starting on a bare IDR no client can decode. The parameter
+                 * is only a scheduling hint, so the extra frames are dropped.
+                 */
+                c->enc_operation_rate =
+                    c->enc_framerate_num / c->enc_framerate_den;
                 c->enc_params_dirty = 1;
             }
         } else if (m->type == VAEncMiscParameterTypeRateControl) {

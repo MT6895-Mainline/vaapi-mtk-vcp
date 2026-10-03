@@ -273,6 +273,8 @@ struct mtkvcp_context {
     int enc_params_dirty;  /* dynamic rate/fps/GOP not yet applied */
     unsigned int enc_applied_bitrate, enc_applied_gop;
     unsigned int enc_applied_fps_num, enc_applied_fps_den;
+    unsigned int enc_operation_rate;   /* client's true rate, sent via OP_RATE */
+    unsigned int enc_applied_op_rate;
     /* Frame-rate accounting for the capture path: how many frames the
      * encoder actually completes, and how long each one waited. The
      * stream rate is decided by krdp from network feedback, so the only
