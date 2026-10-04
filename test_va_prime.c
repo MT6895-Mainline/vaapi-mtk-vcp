@@ -30,8 +30,8 @@
 static int probe_export(VADisplay dpy, unsigned int rt)
 {
     VASurfaceID surface;
-    VADRMPRIMESurfaceDescriptor a, b;
-    struct stat sa, sb;
+    VADRMPRIMESurfaceDescriptor a, b, c;
+    struct stat sa, sb, sc;
     int ten = rt == VA_RT_FORMAT_YUV420_10;
     CHECKST("probe create", vaCreateSurfaces(dpy, rt, 128, 128, &surface, 1, NULL, 0));
     CHECKST("probe export", vaExportSurfaceHandle(dpy, surface,
@@ -40,15 +40,27 @@ static int probe_export(VADisplay dpy, unsigned int rt)
     CHECKST("probe repeat", vaExportSurfaceHandle(dpy, surface,
         VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
         VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &b));
+    /* Clients that leave both layer flags clear (VLC) get separate layers. */
+    CHECKST("probe default layers", vaExportSurfaceHandle(dpy, surface,
+        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        VA_EXPORT_SURFACE_READ_ONLY, &c));
     if (a.num_objects != 1 || a.num_layers != 2 || b.num_layers != 1 ||
+        c.num_objects != 1 || c.num_layers != 2 ||
+        c.layers[0].num_planes != 1 || c.layers[1].num_planes != 1 ||
+        c.layers[1].offset[0] != a.layers[1].offset[0] ||
         a.layers[0].drm_format != (ten ? DRM_FORMAT_R16 : DRM_FORMAT_R8) ||
         a.layers[1].drm_format != (ten ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88) ||
+        c.layers[0].drm_format != a.layers[0].drm_format ||
+        c.layers[1].drm_format != a.layers[1].drm_format ||
         a.layers[1].offset[0] != b.layers[0].offset[1] ||
         a.objects[0].size < (unsigned)(128 * 128 * 3 / (ten ? 1 : 2)) ||
         !(fcntl(a.objects[0].fd, F_GETFD) & FD_CLOEXEC) ||
         fstat(a.objects[0].fd, &sa) || fstat(b.objects[0].fd, &sb) ||
-        sa.st_ino != sb.st_ino) DIE("probe descriptor/identity");
+        fstat(c.objects[0].fd, &sc) ||
+        sa.st_ino != sb.st_ino || sa.st_ino != sc.st_ino)
+        DIE("probe descriptor/identity");
     close(b.objects[0].fd);
+    close(c.objects[0].fd);
     CHECKST("probe destroy", vaDestroySurfaces(dpy, &surface, 1));
     /* Export keeps the zeroed allocation alive after queue/surface destruction. */
     unsigned char *map = mmap(NULL, a.objects[0].size, PROT_READ, MAP_SHARED,
@@ -163,7 +175,8 @@ int main(int argc, char **argv)
         VADRMPRIMESurfaceDescriptor desc;
         st = vaExportSurfaceHandle(dpy, surf,
                                    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                                   VA_EXPORT_SURFACE_READ_ONLY, &desc);
+                                   VA_EXPORT_SURFACE_READ_ONLY |
+                                   VA_EXPORT_SURFACE_COMPOSED_LAYERS, &desc);
         CHECKST("vaExportSurfaceHandle", st);
         printf("prime: fourcc=0x%08x %ux%u objs=%u layers=%u fd=%d\n",
                desc.fourcc, desc.width, desc.height, desc.num_objects,

@@ -33,7 +33,8 @@ void mtkvcp_log(const char *fmt, ...)
     va_list ap;
     if (!mtkvcp_debug_enabled())
         return;
-    fprintf(stderr, "mtk-vcp-va: ");
+    fprintf(stderr, "mtk-vcp-va: [%llu] ",
+            (unsigned long long)mtkvcp_now_us());
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -463,6 +464,9 @@ static VAStatus mtkvcp_BufferInfo(VADriverContextP ctx, VABufferID id,
     VABufferType *type, unsigned int *size, unsigned int *num_elements);
 VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
     VASurfaceID s, uint32_t mem_type, uint32_t flags, void *desc);
+VAStatus mtkvcp_AcquireBufferHandle(VADriverContextP ctx, VABufferID id,
+    VABufferInfo *info);
+VAStatus mtkvcp_ReleaseBufferHandle(VADriverContextP ctx, VABufferID id);
 static VAStatus mtkvcp_SyncBuffer(VADriverContextP ctx, VABufferID id,
     uint64_t timeout_ns);
 static VAStatus mtkvcp_MapBuffer2(VADriverContextP ctx, VABufferID id,
@@ -528,6 +532,8 @@ static VAStatus mtkvcp_Terminate(VADriverContextP ctx)
             mtkvcp_surface_release(d, i);
     for (i = 0; i < MTKVCP_MAX_BUFFERS; i++)
         if (d->buffers[i].in_use) {
+            if (d->buffers[i].handle_fd >= 0)
+                close(d->buffers[i].handle_fd);
             free(d->buffers[i].data);
             free(d->buffers[i].coded_bytes);
             d->buffers[i].in_use = 0;
@@ -793,6 +799,7 @@ static VAStatus mtkvcp_create_surfs_locked(struct mtkvcp_drv *d, int w,
         d->surfaces[si].ctx = -1;
         d->surfaces[si].cap_index = -1;
         d->surfaces[si].prime_fd = -1;
+        d->surfaces[si].bounce_fd = -1;
         d->surfaces[si].imp_fd = -1;
         d->surfaces[si].imp_map = NULL;
         d->surfaces[si].alias_fd = -1;
@@ -1217,6 +1224,8 @@ static VAStatus mtkvcp_CreateBuffer(VADriverContextP ctx, VAContextID c,
     d->buffers[bi].is_coded_seg = 0;
     d->buffers[bi].coded_bytes = NULL;
     d->buffers[bi].coded_size = 0;
+    d->buffers[bi].handle_fd = -1;
+    d->buffers[bi].handle_size = 0;
     if (!d->buffers[bi].data) {
         d->buffers[bi].in_use = 0;
         pthread_mutex_unlock(&d->lock);
@@ -1356,6 +1365,8 @@ static VAStatus mtkvcp_DestroyBuffer(VADriverContextP ctx, VABufferID id)
             return VA_STATUS_ERROR_SURFACE_BUSY;
         }
     }
+    if (d->buffers[bi].handle_fd >= 0)
+        close(d->buffers[bi].handle_fd);
     free(d->buffers[bi].data);
     free(d->buffers[bi].coded_bytes);
     memset(&d->buffers[bi], 0, sizeof(d->buffers[bi]));
@@ -1439,6 +1450,7 @@ static VAStatus mtkvcp_RenderPicture(VADriverContextP ctx, VAContextID c,
             st = VA_STATUS_ERROR_INVALID_BUFFER;
             break;
         }
+        if (getenv("MTK_VCP_VA_TRACE_VERBOSE"))
         mtkvcp_log("  render buf=%d type=%u size=%u num=%u", buffers[i],
                    d->buffers[bi].type, d->buffers[bi].size,
                    d->buffers[bi].num_elements);
@@ -1667,8 +1679,8 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx)
     vt->vaGetSurfaceAttributes = (void *)mtkvcp_not_supported;
     vt->vaCreateSurfaces2 = mtkvcp_CreateSurfaces2;
     vt->vaQuerySurfaceAttributes = mtkvcp_QuerySurfaceAttributes;
-    vt->vaAcquireBufferHandle = (void *)mtkvcp_not_supported;
-    vt->vaReleaseBufferHandle = (void *)mtkvcp_not_supported;
+    vt->vaAcquireBufferHandle = mtkvcp_AcquireBufferHandle;
+    vt->vaReleaseBufferHandle = mtkvcp_ReleaseBufferHandle;
     vt->vaCreateMFContext = (void *)mtkvcp_not_supported;
     vt->vaMFAddContext = (void *)mtkvcp_not_supported;
     vt->vaMFReleaseContext = (void *)mtkvcp_not_supported;

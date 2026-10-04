@@ -172,7 +172,108 @@ static int mtkvcp_qbuf_cap(struct mtkvcp_context *c, int idx)
     b.index = (uint32_t)idx;
     b.length = 1;
     b.m.planes = &pl;
-    return mtkvcp_ioctl(c->vfd, VIDIOC_QBUF, &b);
+    int r = mtkvcp_ioctl(c->vfd, VIDIOC_QBUF, &b);
+
+    if (r == 0)
+        c->cap_queued++;
+    return r;
+}
+
+/* Largest CAPTURE pool worth allocating for this frame: bounded by the
+ * kernel's vb2 limit and a memory budget, but always enough for the
+ * baseline plus the reserve. */
+static int mtkvcp_dec_max_pool(struct mtkvcp_context *c)
+{
+    size_t stride = c->cap_stride > 0 ? (size_t)c->cap_stride : (size_t)c->width;
+    size_t bh = c->cap_bh > 0 ? (size_t)c->cap_bh : (size_t)c->height;
+    size_t frame = stride * bh * 3u / 2u;
+    int max = MTKVCP_MAX_CAP_BUFS;
+
+    if (frame) {
+        int by_mem = (int)(MTKVCP_CAP_BUDGET / frame);
+
+        if (by_mem < max)
+            max = by_mem;
+    }
+    if (max < MTKVCP_CAP_RESERVE + 2)
+        max = MTKVCP_CAP_RESERVE + 2;
+    return max;
+}
+
+/* Grow the CAPTURE queue as the client binds more decode surfaces. One
+ * buffer per held surface is what lets the client keep its frames, plus
+ * MTKVCP_CAP_RESERVE destinations the kernel needs to keep running at
+ * all. vb2 accepts CREATE_BUFS while streaming, so the pool follows the
+ * client's real depth instead of sizing for the worst case up front. */
+static void mtkvcp_dec_grow_capture(struct mtkvcp_drv *d, int ci)
+{
+    struct mtkvcp_context *c = &d->contexts[ci];
+    struct v4l2_create_buffers cb;
+    struct v4l2_format g;
+    int bound = 0, need, i;
+
+    /* Before STREAMON the CAPTURE format is not negotiated yet and the
+     * baseline pool is always enough; growing then would allocate the
+     * wrong geometry. Pre-bound targets are covered by stream start. */
+    if (!c->streaming)
+        return;
+    for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
+        if (d->surfaces[i].in_use && d->surfaces[i].ctx == ci &&
+            d->surfaces[i].kind == MTKVCP_SURF_DECODE)
+            bound++;
+    /* +1 for the surface about to bind. */
+    need = bound + 1 + MTKVCP_CAP_RESERVE;
+    {
+        int max = mtkvcp_dec_max_pool(c);
+
+        if (need > max)
+            need = max;
+    }
+    if (need <= c->cap_count || c->cap_count >= MTKVCP_MAX_CAP_BUFS)
+        return;
+    memset(&g, 0, sizeof(g));
+    g.type = DEC_CAP_TYPE;
+    if (mtkvcp_ioctl(c->vfd, VIDIOC_G_FMT, &g) < 0)
+        return;
+    memset(&cb, 0, sizeof(cb));
+    cb.count = (uint32_t)(need - c->cap_count);
+    cb.memory = V4L2_MEMORY_MMAP;
+    cb.format = g;
+    if (mtkvcp_ioctl(c->vfd, VIDIOC_CREATE_BUFS, &cb) < 0) {
+        mtkvcp_log("grow CAPTURE: CREATE_BUFS +%u (have %d) failed",
+                   cb.count, c->cap_count);
+        return;
+    }
+    for (i = 0; i < (int)cb.count; i++) {
+        int idx = (int)cb.index + i;
+        struct v4l2_buffer b;
+        struct v4l2_plane pl;
+
+        if (idx < 0 || idx >= MTKVCP_MAX_SURFACES)
+            break;
+        memset(&b, 0, sizeof(b));
+        memset(&pl, 0, sizeof(pl));
+        b.type = DEC_CAP_TYPE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = (uint32_t)idx;
+        b.length = 1;
+        b.m.planes = &pl;
+        if (mtkvcp_ioctl(c->vfd, VIDIOC_QUERYBUF, &b) < 0)
+            break;
+        c->cap_len[idx] = pl.length;
+        c->cap_map[idx] = mmap(NULL, pl.length, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, c->vfd, pl.m.mem_offset);
+        if (c->cap_map[idx] == MAP_FAILED) {
+            c->cap_map[idx] = NULL;
+            break;
+        }
+        if (mtkvcp_qbuf_cap(c, idx) < 0)
+            break;
+        c->cap_count = idx + 1;
+        c->cap_mmap_count = idx + 1;
+    }
+    mtkvcp_log("grow CAPTURE: bound=%d count=%d queued=%d", bound,
+               c->cap_count, c->cap_queued);
 }
 
 /* Fixed CAPTURE pool: DPB + reorder + display slack. VAAPI clients
@@ -203,8 +304,15 @@ static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
             d->surfaces[i].kind == MTKVCP_SURF_DECODE)
             bound[nbound++] = i;
     c->pool_size = mtkvcp_dec_pool_size(c);
-    if (c->pool_size > MTKVCP_MAX_SURFACES)
-        c->pool_size = MTKVCP_MAX_SURFACES;
+    /* Pre-bound render targets each need their own destination. */
+    if (nbound + MTKVCP_CAP_RESERVE + 1 > c->pool_size)
+        c->pool_size = nbound + MTKVCP_CAP_RESERVE + 1;
+    {
+        int max = mtkvcp_dec_max_pool(c);
+
+        if (c->pool_size > max)
+            c->pool_size = max;
+    }
     st = mtkvcp_claim_hw(d, ci);
     if (st != VA_STATUS_SUCCESS)
         return st;
@@ -282,20 +390,47 @@ static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
     }
-    if (mtkvcp_v4l2_stream(c->vfd, DEC_OUT_TYPE, 1) < 0 ||
-        mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 1) < 0) {
-        int e = errno;
-        mtkvcp_unmap_all(c);
-        mtkvcp_v4l2_stream(c->vfd, DEC_OUT_TYPE, 0);
-        mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 0);
-        mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
-        mtkvcp_release_hw(d, ci);
-        return e == EBUSY ? VA_STATUS_ERROR_HW_BUSY :
-                            VA_STATUS_ERROR_OPERATION_FAILED;
+    /* The VCP is a single global session and its remoteproc stop/start
+     * cycle takes seconds, so a playback started right after another one
+     * (or after any other client) can see STREAMON return EBUSY for a
+     * while. Wait for the hardware instead of failing the client. */
+    {
+        int streamed, tries = 0;
+
+        for (;;) {
+            streamed = mtkvcp_v4l2_stream(c->vfd, DEC_OUT_TYPE, 1);
+            if (streamed == 0) {
+                streamed = mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 1);
+                if (streamed == 0)
+                    break;
+                mtkvcp_v4l2_stream(c->vfd, DEC_OUT_TYPE, 0);
+            }
+            if (streamed != -EBUSY || ++tries > 40) {
+                mtkvcp_unmap_all(c);
+                mtkvcp_v4l2_stream(c->vfd, DEC_OUT_TYPE, 0);
+                mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 0);
+                mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
+                mtkvcp_release_hw(d, ci);
+                return streamed == -EBUSY ? VA_STATUS_ERROR_HW_BUSY :
+                                            VA_STATUS_ERROR_OPERATION_FAILED;
+            }
+            mtkvcp_log("stream start: VCP busy, retry %d", tries);
+            pthread_mutex_unlock(&d->lock);
+            usleep(250000);
+            pthread_mutex_lock(&d->lock);
+            if (!d->contexts[ci].in_use || c->vfd < 0) {
+                mtkvcp_release_hw(d, ci);
+                return VA_STATUS_ERROR_INVALID_CONTEXT;
+            }
+        }
     }
     c->streaming = 1;
     return VA_STATUS_SUCCESS;
 }
+
+static void mtkvcp_drop_pending(struct mtkvcp_context *c, int si);
+static int mtkvcp_dec_pump(struct mtkvcp_drv *d, int ci, int block,
+                           int timeout_ms);
 
 VAStatus mtkvcp_dec_begin(struct mtkvcp_drv *d, int ci, int si)
 {
@@ -309,9 +444,15 @@ VAStatus mtkvcp_dec_begin(struct mtkvcp_drv *d, int ci, int si)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (s->ctx < 0) {
         /* First use binds the surface to this context. It holds no
-         * buffer until a completion assigns one (cap_index -1). */
-        if (s->width != c->width || s->height != c->height)
+         * buffer until a completion assigns one (cap_index -1).
+         * The context follows the coded size while clients such as
+         * VLC's GL converter size their pool to the visible frame
+         * (e.g. 2460x1080 into 2496x1088), so accept any surface that
+         * fits inside the decoded frame and crop to it on export. */
+        if (s->width > c->width || s->height > c->height ||
+            s->width < MTKVCP_MIN_W || s->height < MTKVCP_MIN_H)
             return VA_STATUS_ERROR_INVALID_SURFACE;
+        mtkvcp_dec_grow_capture(d, ci);
         if (s->prime_fd >= 0) {
             close(s->prime_fd);
             s->prime_fd = -1;
@@ -323,17 +464,48 @@ VAStatus mtkvcp_dec_begin(struct mtkvcp_drv *d, int ci, int si)
     } else if (s->ctx != ci || s->kind != MTKVCP_SURF_DECODE) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
-    if (s->state == MTKVCP_SS_TARGET)
-        return VA_STATUS_ERROR_SURFACE_BUSY;
+    if (s->state == MTKVCP_SS_TARGET) {
+        /* The surface still carries a submitted picture: the client reused
+         * it without syncing (VLC drops late frames, and does so heavily
+         * while the user drags the seek bar). Wait only briefly for a
+         * picture that is about to finish; otherwise drop it and decode
+         * into the surface again. This path must never block for seconds
+         * and must never flush the tail: the client is actively decoding,
+         * and a flush here collapses its Begin/End pairing.
+         */
+        int waited = 0;
+
+        while (s->state == MTKVCP_SS_TARGET && waited < 100 &&
+               !c->error) {
+            if (mtkvcp_dec_pump(d, ci, 1, 20) < 0)
+                break;
+            waited += 20;
+        }
+        if (s->state == MTKVCP_SS_TARGET) {
+            mtkvcp_drop_pending(c, si);
+            mtkvcp_log("reuse: si=%d drops held picture", si);
+            s->state = MTKVCP_SS_IDLE;
+        }
+    }
     if (s->state == MTKVCP_SS_READY) {
-        /* Recycle: hand the finished buffer back to the driver. */
-        if (!c->streaming || s->cap_index < 0)
-            return VA_STATUS_ERROR_INVALID_SURFACE;
-        mtkvcp_log("recycle si=%d buf=%d back to driver", si,
-                   s->cap_index);
-        if (mtkvcp_qbuf_cap(c, s->cap_index) < 0)
-            return VA_STATUS_ERROR_OPERATION_FAILED;
-        s->state = MTKVCP_SS_IDLE;
+        /* Recycle: hand the finished buffer back to the driver. A frame
+         * whose buffer was lost to a queue restart (CAPTURE kick) has no
+         * buffer to return: drop it and decode into the surface again
+         * rather than failing the client's pipeline. */
+        if (!c->streaming || s->cap_index < 0) {
+            mtkvcp_log("recycle si=%d: no buffer (streaming=%d cap=%d), "
+                       "dropped", si, c->streaming, s->cap_index);
+            s->state = MTKVCP_SS_IDLE;
+        } else {
+            mtkvcp_log("recycle si=%d buf=%d back to driver", si,
+                       s->cap_index);
+            if (mtkvcp_qbuf_cap(c, s->cap_index) < 0) {
+                mtkvcp_log("recycle si=%d buf=%d qbuf failed", si,
+                           s->cap_index);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
+            s->state = MTKVCP_SS_IDLE;
+        }
     } else if (s->state != MTKVCP_SS_IDLE) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
@@ -561,7 +733,7 @@ static int mtkvcp_dec_renegotiate(struct mtkvcp_drv *d, int ci)
     struct mtkvcp_context *c = &d->contexts[ci];
     struct v4l2_format g;
     int bound[MTKVCP_MAX_SURFACES];
-    int nbound = 0, i, r, granted;
+    int nbound = 0, i, r, granted, ev_stride, ev_bh;
     mtkvcp_log("renegotiate: rebuilding CAPTURE at event geometry");
     for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
         if (d->surfaces[i].in_use && d->surfaces[i].ctx == ci &&
@@ -572,6 +744,43 @@ static int mtkvcp_dec_renegotiate(struct mtkvcp_drv *d, int ci)
             mtkvcp_log("renegotiate: delivered frames exist -> DRC");
             return -1;
         }
+    /* Read the parsed geometry before touching the queue. If the buffers
+     * allocated at stream start already match it -- the client sized the
+     * context to the coded frame, which is the normal case -- restarting
+     * CAPTURE is all the kernel needs (STREAMON clears wait_capture).
+     * Reallocating a dozen multi-megabyte buffers here costs seconds and
+     * starves the decode-ahead a B-pyramid needs to flush its reorder
+     * window, which otherwise leaves the first sync waiting for 2.5s and
+     * trips the tail flush. */
+    memset(&g, 0, sizeof(g));
+    g.type = DEC_CAP_TYPE;
+    if (mtkvcp_ioctl(c->vfd, VIDIOC_G_FMT, &g) < 0) {
+        mtkvcp_log("renegotiate: G_FMT failed");
+        return -1;
+    }
+    ev_stride = (int)g.fmt.pix_mp.plane_fmt[0].bytesperline;
+    ev_bh = (int)g.fmt.pix_mp.height;
+    if (c->cap_count == c->pool_size &&
+        c->cap_mmap_count == c->pool_size &&
+        ev_stride == c->cap_stride && ev_bh == c->cap_bh) {
+        mtkvcp_log("renegotiate: geometry unchanged (%dx%d stride=%d), "
+                   "restart CAPTURE", ev_bh, ev_stride, ev_stride);
+        mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 0);
+        c->cap_queued = 0;
+        for (i = 0; i < c->pool_size; i++) {
+            if (mtkvcp_qbuf_cap(c, i) < 0) {
+                mtkvcp_log("renegotiate: requeue buf=%d failed", i);
+                return -1;
+            }
+        }
+        if (mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 1) < 0) {
+            mtkvcp_log("renegotiate: CAP STREAMON failed");
+            return -1;
+        }
+        return 0;
+    }
+    mtkvcp_log("renegotiate: event geometry %ux%u",
+               g.fmt.pix_mp.width, g.fmt.pix_mp.height);
     for (i = 0; i < MTKVCP_MAX_SURFACES; i++) {
         if (c->cap_export[i]) {
             close(c->cap_export[i] - 1);
@@ -585,14 +794,6 @@ static int mtkvcp_dec_renegotiate(struct mtkvcp_drv *d, int ci)
             munmap(c->cap_map[i], c->cap_len[i]);
             c->cap_map[i] = NULL;
         }
-    memset(&g, 0, sizeof(g));
-    g.type = DEC_CAP_TYPE;
-    if (mtkvcp_ioctl(c->vfd, VIDIOC_G_FMT, &g) < 0) {
-        mtkvcp_log("renegotiate: G_FMT failed");
-        return -1;
-    }
-    mtkvcp_log("renegotiate: event geometry %ux%u",
-               g.fmt.pix_mp.width, g.fmt.pix_mp.height);
     {
         struct v4l2_format f;
         memset(&f, 0, sizeof(f));
@@ -641,6 +842,7 @@ static int mtkvcp_dec_renegotiate(struct mtkvcp_drv *d, int ci)
             d->surfaces[bound[i]].prime_fd = -1;
         }
     }
+    c->cap_queued = 0;
     for (i = 0; i < c->pool_size; i++) {
         struct v4l2_buffer b;
         struct v4l2_plane pl;
@@ -721,6 +923,20 @@ static void mtkvcp_drain_events(struct mtkvcp_drv *d, int ci)
         c->error = 1;
         return;
     }
+}
+
+/* Forget any in-flight picture targeting this surface. Used when a client
+ * reuses a surface the firmware still holds: that frame is lost, but the
+ * late CAPTURE completion recycles its buffer unmatched instead of marking
+ * a surface that is already decoding again.
+ */
+static void mtkvcp_drop_pending(struct mtkvcp_context *c, int si)
+{
+    int i;
+
+    for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
+        if (c->pend[i].in_use && c->pend[i].surface == si)
+            c->pend[i].in_use = 0;
 }
 
 /* Complete one CAPTURE buffer. Returns 1 if a picture completed. */
@@ -815,10 +1031,17 @@ static int mtkvcp_dec_pump(struct mtkvcp_drv *d, int ci, int block,
                 break;
         } else {
             struct pollfd pfd;
+            int pr;
             pfd.fd = c->vfd;
             pfd.events = POLLIN | POLLPRI;
             pfd.revents = 0;
-            r = poll(&pfd, 1, timeout_ms < 0 ? -1 : timeout_ms);
+            /* Wait without the driver lock: the client's display thread
+             * needs it to sync and export finished frames, and a starved
+             * display is what stops CAPTURE buffers from coming back. */
+            pthread_mutex_unlock(&d->lock);
+            pr = poll(&pfd, 1, timeout_ms < 0 ? -1 : timeout_ms);
+            pthread_mutex_lock(&d->lock);
+            r = pr;
             if (r <= 0) {
                 if (completed)
                     break;
@@ -846,6 +1069,9 @@ static int mtkvcp_dec_pump(struct mtkvcp_drv *d, int ci, int block,
             if (r < 0)
                 return -1;
         }
+        /* The buffer left the kernel queue; keep the reserve count. */
+        if (c->cap_queued > 0)
+            c->cap_queued--;
         /* Zero-payload completions carry no picture (observed: stale
          * timestamps, no LAST). They must not consume a pending slot;
          * hand them straight back. */
@@ -986,6 +1212,41 @@ static int mtkvcp_au_has_idr(const uint8_t *p, size_t len)
             continue;
         if (i + off < len && (p[i + off] & 0x1f) == 5)
             return 1;
+    }
+    return 0;
+}
+
+/* Self-contained AU: H.264 IDR or HEVC IRAP (BLA/IDR/CRA). A resume that
+ * starts here must not replay the pre-flush closure -- those access units
+ * target surfaces the client may already be decoding into again, which
+ * shows up either as old frames flashing past or as a stuck queue.
+ */
+static int mtkvcp_au_is_intra(const uint8_t *p, size_t len,
+                              unsigned int fourcc)
+{
+    size_t i;
+
+    for (i = 0; i + 4 < len; i++) {
+        size_t off;
+        unsigned int t;
+
+        if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1)
+            off = 3;
+        else if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 0 &&
+                 p[i + 3] == 1)
+            off = 4;
+        else
+            continue;
+        if (i + off >= len)
+            continue;
+        if (fourcc == V4L2_PIX_FMT_H264) {
+            if ((p[i + off] & 0x1f) == 5)
+                return 1;
+        } else if (fourcc == V4L2_PIX_FMT_HEVC) {
+            t = (unsigned int)(p[i + off] >> 1) & 0x3f;
+            if (t >= 16 && t <= 21)
+                return 1;
+        }
     }
     return 0;
 }
@@ -1294,6 +1555,7 @@ VAStatus mtkvcp_dec_end(struct mtkvcp_drv *d, int ci)
                     }
                     pid = nlen > 2 ? mtkvcp_hevc_nal_pps_id(
                                          c->au + prev, nlen) : -1;
+                    if (getenv("MTK_VCP_VA_TRACE_VERBOSE"))
                     mtkvcp_log("hevc slice %d off=%zu len=%zu pid=%d",
                                k, prev, nlen, pid);
                     if (pid < 0 || pid > 63) {
@@ -1596,9 +1858,18 @@ VAStatus mtkvcp_dec_end(struct mtkvcp_drv *d, int ci)
         c->stop_sent = 0;
         c->saw_last = 0;
         mtkvcp_log("resumed after tail flush");
-        /* The drain's reset wiped the DPB; put the reference pictures back
-         * before this and later pictures reference them. */
-        mtkvcp_dec_replay(c, d, ci);
+        /* The drain's reset wiped the DPB. A dependent picture needs its
+         * reference closure back; a self-contained IRAP/IDR (seek, channel
+         * change) does not -- and replaying there would both show old
+         * frames and target surfaces already in use again, so drop the
+         * stale ring instead. */
+        if (mtkvcp_au_is_intra(c->au, c->au_len, c->out_fourcc)) {
+            mtkvcp_log("resume: intra AU, replay skipped");
+            c->replay_count = 0;
+            c->replay_idr = -1;
+        } else {
+            mtkvcp_dec_replay(c, d, ci);
+        }
     }
     /* Hand the staged AU to the firmware (shared submit path, also
      * used for held B-frames whose headers are completed later). */
@@ -1755,8 +2026,50 @@ static VAStatus mtkvcp_dec_submit_au(struct mtkvcp_drv *d, int ci)
 }
 
 /* Send DEC_CMD_STOP once: flushes reorder-held tail frames. */
+/* Restart the CAPTURE queue in place without reallocating buffers. The
+ * kernel treats CAPTURE STREAMON as "the client restarted the queue", which
+ * is what clears its draining/wait_capture state and lets queued OUTPUT
+ * access units decode again after a flush-and-resume cycle.
+ */
+static int mtkvcp_dec_kick_capture(struct mtkvcp_drv *d, int ci)
+{
+    struct mtkvcp_context *c = &d->contexts[ci];
+    int i;
+
+    /* The pool may have grown for a client that holds many surfaces, so
+     * requeue everything that is mapped, not just the initial pool. */
+    if (c->vfd < 0 || !c->streaming || c->cap_count <= 0 ||
+        c->cap_mmap_count != c->cap_count) {
+        mtkvcp_log("kick: not restartable ctx=%d streaming=%d mmap=%d/%d",
+                   c->in_use, c->streaming, c->cap_mmap_count, c->cap_count);
+        return -1;
+    }
+    mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 0);
+    c->cap_queued = 0;
+    /* STREAMOFF handed every buffer back to us. Frames that were in flight
+     * are lost with the restart, so drop surface ownership before
+     * requeueing: otherwise the client's next recycle would qbuf a buffer
+     * that is already queued, and every following picture would fail. */
+    for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
+        if (d->surfaces[i].in_use && d->surfaces[i].ctx == ci) {
+            d->surfaces[i].cap_index = -1;
+            d->surfaces[i].state = MTKVCP_SS_IDLE;
+            mtkvcp_drop_pending(c, i);
+        }
+    for (i = 0; i < c->cap_count; i++)
+        if (mtkvcp_qbuf_cap(c, i) < 0) {
+            mtkvcp_log("kick: requeue buf=%d failed", i);
+            return -1;
+        }
+    if (mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 1) < 0)
+        return -1;
+    mtkvcp_log("kick: CAPTURE restarted in place");
+    return 0;
+}
+
 static void mtkvcp_dec_send_stop(struct mtkvcp_context *c)
 {
+    c->resume_at_ms = 0;
     struct v4l2_decoder_cmd cmd;
     if (c->stop_sent || c->vfd < 0)
         return;
@@ -1797,6 +2110,10 @@ VAStatus mtkvcp_dec_sync(struct mtkvcp_drv *d, int si, uint64_t timeout_ns)
         return VA_STATUS_SUCCESS;
     if (s->state == MTKVCP_SS_ERROR)
         return VA_STATUS_ERROR_DECODING_ERROR;
+    /* No work queued for this surface: VAAPI treats that as complete. It
+     * happens after a CAPTURE restart dropped the frames in flight. */
+    if (s->state == MTKVCP_SS_IDLE)
+        return VA_STATUS_SUCCESS;
     if (s->state != MTKVCP_SS_TARGET)
         return VA_STATUS_ERROR_DECODING_ERROR; /* nothing in flight */
     if (ci < 0 || ci >= MTKVCP_MAX_CONTEXTS ||
@@ -1823,6 +2140,7 @@ VAStatus mtkvcp_dec_sync(struct mtkvcp_drv *d, int si, uint64_t timeout_ns)
          * gone (or pathologically stalled for seconds). */
         if (!d->contexts[ci].stop_sent &&
             d->contexts[ci].completed_one && waited >= 2500 &&
+            mtkvcp_now_ms() - d->contexts[ci].last_submit_ms > 2000 &&
             mtkvcp_is_tail(d, ci, si))
             mtkvcp_dec_send_stop(&d->contexts[ci]);
         /* Ordered clients stall on an earlier held frame while the
@@ -1833,9 +2151,52 @@ VAStatus mtkvcp_dec_sync(struct mtkvcp_drv *d, int si, uint64_t timeout_ns)
          * the first sync never reaches the 30 s SYNC_TIMEOUT_MS with
          * any way to flush it. */
         if (!d->contexts[ci].stop_sent &&
-            waited >= 2000 &&
-            mtkvcp_now_ms() - d->contexts[ci].last_submit_ms > 1500)
+            waited >= 3000 &&
+            mtkvcp_now_ms() - d->contexts[ci].last_submit_ms > 3000)
             mtkvcp_dec_send_stop(&d->contexts[ci]);
+        /* The flush released the reorder tail, but the kernel stays drained
+         * until START; a client blocked on those frames (seek, end of
+         * stream) never submits the access unit that used to send it, so
+         * queued AUs would sit forever. Resume by ourselves shortly after
+         * the flush, bounded so a pathological stream cannot loop. */
+        if (d->contexts[ci].stop_sent) {
+            uint64_t now = mtkvcp_now_ms();
+
+            if (!d->contexts[ci].resume_at_ms)
+                d->contexts[ci].resume_at_ms = now + 400;
+            else if (now >= d->contexts[ci].resume_at_ms &&
+                     d->contexts[ci].resume_count < 8) {
+                struct v4l2_decoder_cmd cmd;
+
+                int ok;
+
+                memset(&cmd, 0, sizeof(cmd));
+                cmd.cmd = V4L2_DEC_CMD_START;
+                ok = mtkvcp_ioctl(d->contexts[ci].vfd,
+                                  VIDIOC_DECODER_CMD, &cmd) == 0;
+                if (!ok) {
+                    /* Draining but not stopped: the kernel refuses START
+                     * until the queue is restarted. */
+                    if (mtkvcp_dec_kick_capture(d, ci) == 0) {
+                        memset(&cmd, 0, sizeof(cmd));
+                        cmd.cmd = V4L2_DEC_CMD_START;
+                        ok = mtkvcp_ioctl(d->contexts[ci].vfd,
+                                          VIDIOC_DECODER_CMD, &cmd) == 0;
+                    }
+                }
+                if (ok) {
+                    d->contexts[ci].stop_sent = 0;
+                    d->contexts[ci].saw_last = 0;
+                    d->contexts[ci].resume_at_ms = 0;
+                    d->contexts[ci].resume_count++;
+                    mtkvcp_log("resumed after drain (auto %d)",
+                               d->contexts[ci].resume_count);
+                } else if (!d->contexts[ci].resume_logged) {
+                    d->contexts[ci].resume_logged = 1;
+                    mtkvcp_log("auto-resume: START refused, kick failed");
+                }
+            }
+        }
         if (budget_ms >= 0) {
             if (waited >= budget_ms)
                 return VA_STATUS_ERROR_DECODING_ERROR;
@@ -1845,6 +2206,7 @@ VAStatus mtkvcp_dec_sync(struct mtkvcp_drv *d, int si, uint64_t timeout_ns)
     }
 }
 
+/* Strict VAAPI semantics: returns only when the frame is ready. */
 /* Stage decoded frames the client has not read yet into CPU memory.
  *
  * VAAPI keeps a surface valid after its context is destroyed, so the

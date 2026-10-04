@@ -57,6 +57,28 @@ int mtkvcp_dmabuf_cpu_read(int fd)
 }
 
 /*
+ * Bracket a CPU write into a dma-buf that a device will read next. The
+ * START side tells the exporter to expect CPU stores; the END side makes
+ * them visible to the device.
+ */
+int mtkvcp_dmabuf_cpu_write(int fd)
+{
+    struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START |
+                                        DMA_BUF_SYNC_WRITE };
+    int r;
+
+    if (fd < 0)
+        return -EINVAL;
+    r = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    if (r < 0)
+        return -errno;
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0)
+        return -errno;
+    return 0;
+}
+
+/*
  * Allocate a dma-buf from the system heap. The capture path needs one to
  * hand the encoder a buffer it can DMA from directly; without a heap the
  * OUTPUT queue would have to stay in MMAP memory and every frame would be
@@ -75,6 +97,31 @@ int mtkvcp_dma_heap_alloc(size_t size)
         return -errno;
     if (ioctl(h, DMA_HEAP_IOCTL_ALLOC, &d) < 0) {
         int e = errno;
+        close(h);
+        return -e;
+    }
+    close(h);
+    return (int)d.fd;
+}
+
+/*
+ * Allocate from the generic system heap. Bounce buffers only need to be
+ * readable by the GPU, and the CMA region is tiny (32 MB on xaga) and
+ * shared with the display and VCP paths, so never take those from it.
+ */
+int mtkvcp_dma_heap_alloc_system(size_t size)
+{
+    struct dma_heap_allocation_data d = {
+        .len = size,
+        .fd_flags = O_RDWR | O_CLOEXEC,
+    };
+    int h = open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC);
+
+    if (h < 0)
+        return -errno;
+    if (ioctl(h, DMA_HEAP_IOCTL_ALLOC, &d) < 0) {
+        int e = errno;
+
         close(h);
         return -e;
     }

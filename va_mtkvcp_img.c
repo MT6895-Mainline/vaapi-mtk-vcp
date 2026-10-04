@@ -40,10 +40,15 @@ void mtkvcp_surface_release(struct mtkvcp_drv *d, int si)
     free(d->surfaces[si].enc_data);
     if (d->surfaces[si].alias_fd >= 0)
         close(d->surfaces[si].alias_fd);
+    if (d->surfaces[si].bounce_map)
+        munmap(d->surfaces[si].bounce_map, d->surfaces[si].bounce_size);
+    if (d->surfaces[si].bounce_fd >= 0)
+        close(d->surfaces[si].bounce_fd);
     memset(&d->surfaces[si], 0, sizeof(d->surfaces[si]));
     d->surfaces[si].ctx = -1;
     d->surfaces[si].cap_index = -1;
     d->surfaces[si].prime_fd = -1;
+    d->surfaces[si].bounce_fd = -1;
     d->surfaces[si].imp_fd = -1;
     d->surfaces[si].alias_fd = -1;
 }
@@ -111,6 +116,8 @@ static int mtkvcp_image_buffer(struct mtkvcp_drv *d, size_t total, void *data,
     d->buffers[bi].map_alias = alias;
     d->buffers[bi].is_coded_seg = 0;
     d->buffers[bi].coded_bytes = NULL;
+    d->buffers[bi].handle_fd = -1;
+    d->buffers[bi].handle_size = 0;
     return bi;
 }
 
@@ -173,6 +180,18 @@ VAStatus mtkvcp_CreateImage(VADriverContextP ctx, VAImageFormat *f,
     return VA_STATUS_SUCCESS;
 }
 
+/* Byte stride of the dma-buf an UNBOUND surface exports. The external
+ * API (VLC's EGL converter) takes the pitch from the derived image, and
+ * Panfrost rejects plane pitches that are not a multiple of 64 bytes
+ * (P010: 32 pixels). Stage and export with that same aligned stride. */
+static int mtkvcp_export_stride_for(unsigned int fourcc, int width)
+{
+    unsigned int px = fourcc == V4L2_PIX_FMT_P010 ? 32u : 64u;
+    int stride = (int)(((unsigned int)width + px - 1u) & ~(px - 1u));
+
+    return fourcc == V4L2_PIX_FMT_P010 ? stride * 2 : stride;
+}
+
 VAStatus mtkvcp_DeriveImage(VADriverContextP ctx, VASurfaceID s,
     VAImage *image)
 {
@@ -203,9 +222,13 @@ VAStatus mtkvcp_DeriveImage(VADriverContextP ctx, VASurfaceID s,
          * reuses the same storage. Reading a pre-decode derived image
          * after the surface decoded is a client aliasing bug. */
         size_t need;
-        need = (size_t)d->surfaces[si].width *
-               (size_t)d->surfaces[si].height * 3u / 2u;
+        int stride, ten;
+        ten = d->surfaces[si].fourcc == V4L2_PIX_FMT_P010;
+        stride = mtkvcp_export_stride_for(d->surfaces[si].fourcc,
+                                          d->surfaces[si].width);
         if (!d->surfaces[si].enc_data) {
+            need = (size_t)stride *
+                   (size_t)d->surfaces[si].height * 3u / 2u;
             d->surfaces[si].enc_data = malloc(need ? need : 1);
             if (!d->surfaces[si].enc_data) {
                 pthread_mutex_unlock(&d->lock);
@@ -213,17 +236,21 @@ VAStatus mtkvcp_DeriveImage(VADriverContextP ctx, VASurfaceID s,
             }
             memset(d->surfaces[si].enc_data, 0, need ? need : 1);
             d->surfaces[si].enc_size = need;
-            d->surfaces[si].enc_stride = d->surfaces[si].width;
+            d->surfaces[si].enc_stride = stride;
+            d->surfaces[si].enc_rgb = 0;
         }
-        f.fourcc = VA_FOURCC_NV12;
+        /* A surface already backed by the encoder keeps its own layout;
+         * report what the staging actually has. */
+        stride = d->surfaces[si].enc_stride;
+        f.fourcc = ten ? VA_FOURCC_P010 : VA_FOURCC_NV12;
         f.byte_order = VA_LSB_FIRST;
-        f.bits_per_pixel = 12;
+        f.bits_per_pixel = ten ? 24 : 12;
         base = d->surfaces[si].enc_data;
         num_planes = 2;
-        pitches[0] = d->surfaces[si].enc_stride;
-        pitches[1] = d->surfaces[si].enc_stride;
+        pitches[0] = stride;
+        pitches[1] = stride;
         offsets[0] = 0;
-        offsets[1] = d->surfaces[si].enc_stride * d->surfaces[si].height;
+        offsets[1] = stride * d->surfaces[si].height;
         total = (size_t)offsets[1] * 3u / 2u;
         ii = mtkvcp_alloc_image(d);
         if (ii < 0) {
@@ -342,6 +369,8 @@ VAStatus mtkvcp_DestroyImage(VADriverContextP ctx, VAImageID id)
                d->images[ii].data);
     bi = d->images[ii].buf - 1;
     if (bi >= 0 && bi < MTKVCP_MAX_BUFFERS && d->buffers[bi].in_use) {
+        if (d->buffers[bi].handle_fd >= 0)
+            close(d->buffers[bi].handle_fd);
         free(d->buffers[bi].data);
         memset(&d->buffers[bi], 0, sizeof(d->buffers[bi]));
     }
@@ -603,6 +632,191 @@ out:
     return ret;
 }
 
+/* ---- dma-buf handle export (vaAcquire/vaReleaseBufferHandle) ---- */
+
+/* Borrowed dma-buf of a surface, exported on first use. Caller holds
+ * d->lock. Returns the fd, or -1 when the surface has no dma-buf. */
+static int mtkvcp_surface_dmabuf(struct mtkvcp_drv *d, int si)
+{
+    struct mtkvcp_surface *s = &d->surfaces[si];
+
+    if (s->kind == MTKVCP_SURF_UNBOUND || s->kind == MTKVCP_SURF_ENC_INPUT) {
+        if (s->prime_fd < 0 && mtkvcp_export_unbound(s) < 0)
+            return -1;
+        return s->prime_fd;
+    }
+    if (s->kind == MTKVCP_SURF_DECODE) {
+        struct mtkvcp_context *c;
+        int ci = s->ctx, idx = s->cap_index;
+
+        if (ci < 0 || ci >= MTKVCP_MAX_CONTEXTS || !d->contexts[ci].in_use)
+            return -1;
+        c = &d->contexts[ci];
+        if (idx < 0 || idx >= c->cap_count || idx >= MTKVCP_MAX_SURFACES)
+            return -1;
+        /* Hand the frame out only once decoding into it has completed. */
+        if (mtkvcp_dec_sync(d, si, 0) != VA_STATUS_SUCCESS)
+            return -1;
+        if (!c->cap_export[idx]) {
+            struct v4l2_exportbuffer exp;
+
+            memset(&exp, 0, sizeof(exp));
+            exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            exp.index = (uint32_t)idx;
+            exp.plane = 0;
+            exp.flags = O_RDONLY | O_CLOEXEC;
+            if (ioctl(c->vfd, VIDIOC_EXPBUF, &exp) < 0)
+                return -1;
+            c->cap_export[idx] = exp.fd + 1;
+        }
+        return c->cap_export[idx] - 1;
+    }
+    return -1;
+}
+
+/* VLC's OpenGL converter derives an image from a pool surface and then
+ * calls vaAcquireBufferHandle() on the image's backing VABuffer to check
+ * that the surface can be imported into EGL as a dma-buf before it uses
+ * it as a render target. The handle is a dup of the surface's export so
+ * the client can hold it while VA-API keeps ownership of the surface. */
+VAStatus mtkvcp_AcquireBufferHandle(VADriverContextP ctx, VABufferID id,
+    VABufferInfo *info)
+{
+    struct mtkvcp_drv *d = (struct mtkvcp_drv *)ctx->pDriverData;
+    int bi = (int)id - 1, ii, si = -1, base, fd;
+    off_t size;
+
+    if (!info)
+        return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (info->mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME)
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    if (bi < 0 || bi >= MTKVCP_MAX_BUFFERS)
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    pthread_mutex_lock(&d->lock);
+    if (!d->buffers[bi].in_use) {
+        pthread_mutex_unlock(&d->lock);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    if (d->buffers[bi].type != VAImageBufferType) {
+        pthread_mutex_unlock(&d->lock);
+        return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+    }
+    if (d->buffers[bi].handle_fd >= 0) {
+        info->handle = (intptr_t)d->buffers[bi].handle_fd;
+        info->mem_size = d->buffers[bi].handle_size;
+        pthread_mutex_unlock(&d->lock);
+        return VA_STATUS_SUCCESS;
+    }
+    /* The image that owns this buffer names the surface it was derived
+     * from; images from vaCreateImage have no surface storage. */
+    for (ii = 0; ii < MTKVCP_MAX_IMAGES; ii++) {
+        if (d->images[ii].in_use && d->images[ii].buf == (int)id &&
+            d->images[ii].derived_surface >= 0) {
+            si = d->images[ii].derived_surface;
+            break;
+        }
+    }
+    if (si < 0 || si >= MTKVCP_MAX_SURFACES) {
+        pthread_mutex_unlock(&d->lock);
+        return VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE;
+    }
+    base = mtkvcp_surface_dmabuf(d, si);
+    if (base < 0) {
+        pthread_mutex_unlock(&d->lock);
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+    size = lseek(base, 0, SEEK_END);
+    fd = fcntl(base, F_DUPFD_CLOEXEC, 0);
+    if (fd < 0) {
+        pthread_mutex_unlock(&d->lock);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+    d->buffers[bi].handle_fd = fd;
+    d->buffers[bi].handle_size =
+        size > 0 && (uint64_t)size <= UINT32_MAX ? (unsigned int)size : 0;
+    info->handle = (intptr_t)fd;
+    info->mem_size = d->buffers[bi].handle_size;
+    mtkvcp_log("AcquireBufferHandle buf=%d si=%d kind=%d fd=%d size=%u",
+               (int)id, si + 1, d->surfaces[si].kind, fd,
+               d->buffers[bi].handle_size);
+    pthread_mutex_unlock(&d->lock);
+    return VA_STATUS_SUCCESS;
+}
+
+/* Paired with vaAcquireBufferHandle. Clients release the handle when the
+ * EGL images built from it are gone; releasing a buffer that was never
+ * acquired (the client's error path) is a no-op. */
+VAStatus mtkvcp_ReleaseBufferHandle(VADriverContextP ctx, VABufferID id)
+{
+    struct mtkvcp_drv *d = (struct mtkvcp_drv *)ctx->pDriverData;
+    int bi = (int)id - 1;
+
+    if (bi < 0 || bi >= MTKVCP_MAX_BUFFERS)
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    pthread_mutex_lock(&d->lock);
+    if (!d->buffers[bi].in_use) {
+        pthread_mutex_unlock(&d->lock);
+        return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    if (d->buffers[bi].handle_fd >= 0) {
+        close(d->buffers[bi].handle_fd);
+        d->buffers[bi].handle_fd = -1;
+        d->buffers[bi].handle_size = 0;
+    }
+    pthread_mutex_unlock(&d->lock);
+    return VA_STATUS_SUCCESS;
+}
+
+/* Copy a decoded CAPTURE frame into a 64-byte aligned dma-buf, cached
+ * on the surface. Panfrost refuses EGL imports whose plane pitch is not a
+ * multiple of 64 bytes, while some H.264 streams are only 16-byte pitched
+ * (2460 -> 2464); the client gets an aligned copy instead of a green or
+ * torn picture. Caller holds d->lock. */
+static int mtkvcp_bounce_export(struct mtkvcp_drv *d, int si,
+                                const uint8_t *src, int stride, int bh)
+{
+    struct mtkvcp_surface *s = &d->surfaces[si];
+    int want = (stride + 63) & ~63;
+    int rows = bh + bh / 2, y;
+    uint8_t *dst;
+    size_t need;
+
+    if (s->bounce_fd >= 0 && s->bounce_stride != want) {
+        munmap(s->bounce_map, s->bounce_size);
+        s->bounce_map = NULL;
+        close(s->bounce_fd);
+        s->bounce_fd = -1;
+    }
+    if (s->bounce_fd < 0) {
+        need = (size_t)want * (size_t)bh * 3u / 2u;
+        s->bounce_fd = mtkvcp_dma_heap_alloc_system(need);
+        if (s->bounce_fd < 0)
+            return -1;
+        s->bounce_map = mmap(NULL, need, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, s->bounce_fd, 0);
+        if (s->bounce_map == MAP_FAILED) {
+            s->bounce_map = NULL;
+            close(s->bounce_fd);
+            s->bounce_fd = -1;
+            return -1;
+        }
+        s->bounce_stride = want;
+        s->bounce_size = need;
+        mtkvcp_log("bounce export: si=%d pitch %d -> %d (%zu bytes)",
+                   si, stride, want, need);
+    }
+    if (!src || !s->bounce_map)
+        return -1;
+    dst = s->bounce_map;
+    for (y = 0; y < rows; y++) {
+        memcpy(dst + (size_t)y * want, src + (size_t)y * stride, stride);
+        memset(dst + (size_t)y * want + stride, 0,
+               (size_t)(want - stride));
+    }
+    mtkvcp_dmabuf_cpu_write(s->bounce_fd);
+    return 0;
+}
+
 VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
     VASurfaceID s, uint32_t mem_type, uint32_t flags, void *desc)
 {
@@ -612,7 +826,7 @@ VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
     int si = (int)s - 1, ci, fd, uvoff, ten_bit, stride, bh, base_fd, idx;
     int uvbh;
     unsigned int fourcc;
-    off_t object_size;
+    off_t object_size, known_size = 0;
     VAStatus st;
     if (!desc)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -672,7 +886,15 @@ VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
                bh : d->surfaces[si].height;
         goto exported;
     }
-    st = mtkvcp_dec_sync(d, si, 0);
+    {
+        uint64_t t0 = mtkvcp_now_us();
+
+        st = mtkvcp_dec_sync(d, si, 0);
+        if (mtkvcp_now_us() - t0 > 50000)
+            mtkvcp_log("export: si=%d state=%d waited %llu ms", si,
+                       d->surfaces[si].state,
+                       (unsigned long long)(mtkvcp_now_us() - t0) / 1000);
+    }
     if (st != VA_STATUS_SUCCESS) {
         pthread_mutex_unlock(&d->lock);
         return st;
@@ -691,6 +913,7 @@ VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
         exp.plane = 0;
         exp.flags = O_RDONLY | O_CLOEXEC;
         if (ioctl(d->contexts[ci].vfd, VIDIOC_EXPBUF, &exp) < 0) {
+            mtkvcp_log("export fail: EXPBUF idx=%d errno=%d", idx, errno);
             pthread_mutex_unlock(&d->lock);
             return VA_STATUS_ERROR_OPERATION_FAILED;
         }
@@ -701,16 +924,39 @@ VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
     bh = d->contexts[ci].cap_bh;
     fourcc = d->contexts[ci].cap_fourcc;
     uvbh = bh;
+    /* Panfrost refuses EGL imports whose plane pitch is not a multiple
+     * of 64 bytes; some H.264 streams are only 16-byte pitched (2460 ->
+     * 2464). Hand the client an aligned copy instead of a broken image. */
+    if (stride & 63) {
+        if (mtkvcp_bounce_export(d, si,
+                                 d->contexts[ci].cap_map[idx],
+                                 stride, bh) < 0) {
+            mtkvcp_log("export fail: bounce si=%d stride=%d bh=%d map=%p",
+                       si, stride, bh,
+                       d->contexts[ci].cap_map[idx]);
+            pthread_mutex_unlock(&d->lock);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        base_fd = d->surfaces[si].bounce_fd;
+        stride = d->surfaces[si].bounce_stride;
+        known_size = (off_t)d->surfaces[si].bounce_size;
+    }
 exported:
-    object_size = lseek(base_fd, 0, SEEK_END);
+    /* dma-heap objects do not answer lseek(), so the bounce carries its
+     * own size. */
+    object_size = known_size > 0 ? known_size : lseek(base_fd, 0, SEEK_END);
     if (object_size <= 0 || (uint64_t)object_size > UINT32_MAX ||
         stride <= 0 || bh < d->surfaces[si].height ||
         (uint64_t)stride * (bh + (uint64_t)bh / 2) > (uint64_t)object_size) {
+        mtkvcp_log("export fail: size=%lld stride=%d bh=%d h=%d bounce=%d",
+                   (long long)object_size, stride, bh,
+                   d->surfaces[si].height, d->surfaces[si].bounce_fd >= 0);
         pthread_mutex_unlock(&d->lock);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
     fd = fcntl(base_fd, F_DUPFD_CLOEXEC, 0);
     if (fd < 0) {
+        mtkvcp_log("export fail: dup base_fd=%d errno=%d", base_fd, errno);
         pthread_mutex_unlock(&d->lock);
         return VA_STATUS_ERROR_OPERATION_FAILED;
     }
@@ -726,7 +972,10 @@ exported:
     prime->objects[0].fd = fd;
     prime->objects[0].size = (uint32_t)object_size;
     prime->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
-    if (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) {
+    /* Clients that want composed layers say so explicitly; both VLC and
+     * Mesa leave the layer flags clear and expect one single-plane layer
+     * per plane, so separate is the default. */
+    if (!(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
         prime->num_layers = 2;
         prime->layers[0].drm_format = ten_bit ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
         prime->layers[1].drm_format = ten_bit ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;

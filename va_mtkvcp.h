@@ -51,6 +51,15 @@
 #define MTKVCP_CAP_BUFS_ENC   6   /* coded-out ring for encode */
 #define MTKVCP_ENC_MAX_JOBS   8   /* jobs may outlive their OUTPUT slot */
 #define MTKVCP_OUT_SIZE_MAX   (4u * 1024u * 1024u) /* one AU must fit */
+/* CAPTURE buffers kept queued in the kernel at all times. The m2m job
+ * only runs while a destination buffer is queued, so this slack is what
+ * lets decoding continue when the client's display holds the rest. */
+#define MTKVCP_CAP_RESERVE    3
+/* One vb2 queue holds at most VB2_MAX_FRAME buffers. */
+#define MTKVCP_MAX_CAP_BUFS   32
+/* Ceiling for the CAPTURE pool (one buffer per client surface plus slack;
+ * a 4K60 client holding the whole budget would be ~256 MB). */
+#define MTKVCP_CAP_BUDGET     (256u * 1024u * 1024u)
 
 /* Verified envelope (see docs/video/CAPABILITIES.md). */
 #define MTKVCP_MAX_W 3840
@@ -118,6 +127,13 @@ struct mtkvcp_surface {
      * (1.2 ms on a 2460x1080 frame), and the answer cannot change for the
      * lifetime of the import. -1 = not probed yet. */
     int imp_dmabuf;
+    /* 64-byte aligned bounce for export when the firmware stride is not
+     * (Panfrost rejects unaligned EGL pitches; H.264 at 2460 is pitched
+     * at 2464). Copied per export, cached per surface. */
+    int bounce_fd;        /* -1 = none */
+    void *bounce_map;
+    int bounce_stride;
+    size_t bounce_size;
     /* Zero-copy hand-off: when the post-processing step would only copy an
      * imported dma-buf into its own staging, the buffer can instead be
      * passed straight to the encoder through V4L2 DMABUF memory. These
@@ -146,6 +162,11 @@ struct mtkvcp_buffer {
     size_t coded_capacity; /* allocated bytes at coded_bytes */
     unsigned int coded_status;
     int coded_busy;        /* an encode job will still write this buffer */
+    /* dma-buf export held between vaAcquireBufferHandle and
+     * vaReleaseBufferHandle. The fd is a dup the driver owns; -1 = not
+     * acquired. handle_size is the exported object's byte size. */
+    int handle_fd;
+    unsigned int handle_size;
 };
 
 /* One submitted-but-not-yet-retired encode frame. OUTPUT and CAPTURE
@@ -244,6 +265,13 @@ struct mtkvcp_context {
     int out_next;
     /* CAPTURE (decode): pool mirrors the client's render targets */
     int cap_mmap_count;
+    int cap_queued;           /* CAPTURE buffers currently queued in V4L2 */
+    /* Auto-resume bookkeeping after a tail flush: the kernel stays drained
+     * until V4L2_DEC_CMD_START, and a client blocked on the held frames
+     * never submits the access unit that used to trigger it. */
+    uint64_t resume_at_ms;
+    int resume_count;
+    int resume_logged;
     void *cap_map[MTKVCP_MAX_SURFACES];
     size_t cap_len[MTKVCP_MAX_SURFACES];
     int cap_export[MTKVCP_MAX_SURFACES]; /* cached fd + 1, zero if absent */
@@ -457,9 +485,11 @@ int mtkvcp_v4l2_reqbufs(int fd, enum v4l2_buf_type type, int count);
 int mtkvcp_v4l2_stream(int fd, enum v4l2_buf_type type, int on);
 int mtkvcp_v4l2_subscribe(int fd, uint32_t evtype);
 int mtkvcp_dma_heap_alloc(size_t size);
+int mtkvcp_dma_heap_alloc_system(size_t size);
 int mtkvcp_v4l2_reqbufs_mem(int fd, enum v4l2_buf_type type, int count,
                             uint32_t memory);
 int mtkvcp_fd_is_dmabuf(int fd);
 int mtkvcp_dmabuf_cpu_read(int fd);
+int mtkvcp_dmabuf_cpu_write(int fd);
 
 #endif /* VA_MTKVCP_H */
