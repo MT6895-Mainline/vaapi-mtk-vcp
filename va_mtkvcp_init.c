@@ -1031,6 +1031,7 @@ static VAStatus mtkvcp_CreateContext(VADriverContextP ctx, VAConfigID cfg,
     }
     memset(&d->contexts[ci], 0, sizeof(d->contexts[ci]));
     d->contexts[ci].in_use = 1;
+    d->contexts[ci].replay_idr = -1;
     d->contexts[ci].is_vpp = p->is_vpp;
     d->contexts[ci].config = cci;
     d->contexts[ci].is_encode = p->is_encode;
@@ -1147,6 +1148,12 @@ static VAStatus mtkvcp_DestroyContext(VADriverContextP ctx, VAContextID id)
         }
     free(d->contexts[ci].au);
     free(d->contexts[ci].enc_au);
+    {
+        int ri;
+
+        for (ri = 0; ri < MTKVCP_REPLAY_MAX; ri++)
+            free(d->contexts[ci].replay_au[ri]);
+    }
     d->contexts[ci].in_use = 0;
     pthread_mutex_unlock(&d->lock);
     return VA_STATUS_SUCCESS;

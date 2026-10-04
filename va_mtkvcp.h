@@ -43,6 +43,9 @@
 #define MTKVCP_MAX_SURFACES   64
 #define MTKVCP_MAX_BUFFERS    256
 #define MTKVCP_MAX_IMAGES     64
+/* AUs buffered per decode context so a mid-stream drain can rebuild the
+ * firmware DPB (see the replay fields in struct mtkvcp_context). */
+#define MTKVCP_REPLAY_MAX     64
 #define MTKVCP_OUT_BUFS_DEC   8   /* OUTPUT (coded in) ring */
 #define MTKVCP_OUT_BUFS_ENC   4
 #define MTKVCP_CAP_BUFS_ENC   6   /* coded-out ring for encode */
@@ -329,6 +332,19 @@ struct mtkvcp_context {
     int mp2_anchored_once; /* first inter-anchor interval: N unknown */
     int slice_offs[40];   /* AU offsets of slice NAL starts */
     int nslices;
+    /* Mid-stream drain recovery. The firmware reset that resumes after a
+     * flush discards the DPB, so the AUs from the last IDR are re-submitted
+     * to rebuild it before the stream continues. Replayed pictures go out
+     * with timestamp 0 and no pend record, so their completions are
+     * unattributed and simply requeued. */
+    uint8_t *replay_au[MTKVCP_REPLAY_MAX];
+    size_t   replay_len[MTKVCP_REPLAY_MAX];
+    int      replay_target[MTKVCP_REPLAY_MAX];   /* AU render target surface */
+    int      replay_nref[MTKVCP_REPLAY_MAX];     /* H.264 refs captured */
+    int      replay_ref[MTKVCP_REPLAY_MAX][16];  /* referenced surface idx */
+    int      replay_next;      /* ring write position */
+    int      replay_count;     /* valid entries */
+    int      replay_idr;       /* ring index of the last IDR, -1 = none */
     /* drain */
     int stop_sent;
     int saw_last;

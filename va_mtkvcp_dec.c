@@ -968,6 +968,186 @@ static int mtkvcp_avcc_to_annexb(struct mtkvcp_context *c)
 
 static VAStatus mtkvcp_dec_submit_au(struct mtkvcp_drv *d, int ci);
 
+/* Does this Annex-B AU carry an IDR slice? H.264 only; other codecs keep
+ * the replay ring but never restart it from an IDR. */
+static int mtkvcp_au_has_idr(const uint8_t *p, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i + 4 < len; i++) {
+        size_t off;
+
+        if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1)
+            off = 3;
+        else if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 0 &&
+                 p[i + 3] == 1)
+            off = 4;
+        else
+            continue;
+        if (i + off < len && (p[i + off] & 0x1f) == 5)
+            return 1;
+    }
+    return 0;
+}
+
+/* Newest ring entry that decoded into surface si, or -1. */
+static int mtkvcp_replay_find(struct mtkvcp_context *c, int si)
+{
+    int i;
+
+    for (i = c->replay_count - 1; i >= 0; i--) {
+        int idx = (c->replay_next - c->replay_count + i +
+                   MTKVCP_REPLAY_MAX) % MTKVCP_REPLAY_MAX;
+
+        if (c->replay_len[idx] && c->replay_target[idx] == si)
+            return idx;
+    }
+    return -1;
+}
+
+/* Re-submit the pictures a mid-stream drain dropped. For H.264 that is the
+ * transitive reference closure of the current picture, so only the live
+ * references are re-decoded; other codecs (and any reference that has aged
+ * out of the ring) fall back to the last-IDR window. Replay pictures carry
+ * timestamp 0 and no pend record, so the driver treats their completions as
+ * unattributed and requeues them. */
+static void mtkvcp_dec_replay(struct mtkvcp_context *c, struct mtkvcp_drv *d,
+                              int ci)
+{
+    unsigned char take[MTKVCP_REPLAY_MAX];
+    int n = c->replay_count, i, q, fallback = 0;
+
+    if (!n)
+        return;
+    memset(take, 0, sizeof(take));
+    if ((c->out_fourcc == V4L2_PIX_FMT_H264 && c->h264_pic_valid) ||
+        (c->out_fourcc == V4L2_PIX_FMT_HEVC && c->hevc_pic_valid)) {
+        int work[MTKVCP_REPLAY_MAX];
+        int seed[16], nseed = 0;
+        int w = 0, k = 0;
+
+        if (c->out_fourcc == V4L2_PIX_FMT_HEVC) {
+            for (q = 0; q < 15; q++) {
+                const VAPictureHEVC *rp =
+                    &c->hevc_pic.ReferenceFrames[q];
+
+                if ((rp->flags & VA_PICTURE_HEVC_INVALID) ||
+                    (int)rp->picture_id <= 0)
+                    continue;
+                seed[nseed++] = (int)rp->picture_id - 1;
+            }
+        } else {
+            for (q = 0; q < 16; q++) {
+                const VAPictureH264 *rp =
+                    &c->h264_pic.ReferenceFrames[q];
+
+                if ((rp->flags & VA_PICTURE_H264_INVALID) ||
+                    (int)rp->picture_id <= 0)
+                    continue;
+                seed[nseed++] = (int)rp->picture_id - 1;
+            }
+        }
+        for (q = 0; q < nseed; q++) {
+            int idx = mtkvcp_replay_find(c, seed[q]);
+
+            if (idx < 0) {
+                fallback = 1;
+                break;
+            }
+            if (!take[idx]) {
+                take[idx] = 1;
+                work[w++] = idx;
+            }
+        }
+        while (!fallback && k < w) {
+            int idx = work[k++];
+
+            for (q = 0; q < c->replay_nref[idx]; q++) {
+                int ridx = mtkvcp_replay_find(c, c->replay_ref[idx][q]);
+
+                if (ridx < 0) {
+                    fallback = 1;
+                    break;
+                }
+                if (!take[ridx]) {
+                    take[ridx] = 1;
+                    work[w++] = ridx;
+                }
+            }
+        }
+    } else {
+        fallback = 1;
+    }
+    if (fallback) {
+        int start = 0;
+
+        memset(take, 0, sizeof(take));
+        if (c->replay_idr >= 0) {
+            int oldest = (c->replay_next - n + MTKVCP_REPLAY_MAX) %
+                         MTKVCP_REPLAY_MAX;
+            int dist = (c->replay_idr - oldest + MTKVCP_REPLAY_MAX) %
+                       MTKVCP_REPLAY_MAX;
+
+            if (dist < n)
+                start = dist;
+        }
+        for (i = start; i < n; i++)
+            take[(c->replay_next - n + i + MTKVCP_REPLAY_MAX) %
+                 MTKVCP_REPLAY_MAX] = 1;
+        mtkvcp_log("replay: fallback window %d AUs", n - start);
+    }
+    {
+        int oldest = (c->replay_next - n + MTKVCP_REPLAY_MAX) %
+                     MTKVCP_REPLAY_MAX;
+        int submitted = 0;
+
+        for (i = 0; i < n; i++) {
+            int idx = (oldest + i) % MTKVCP_REPLAY_MAX;
+            struct v4l2_buffer b;
+            struct v4l2_plane pl;
+            int slot = -1, k, waited = 0;
+
+            if (!take[idx] || !c->replay_len[idx])
+                continue;
+            for (k = 0; k < c->out_count; k++)
+                if (c->out_free[k]) {
+                    slot = k;
+                    break;
+                }
+            while (slot < 0 && waited < 10000 && !c->error) {
+                if (mtkvcp_dec_pump(d, ci, 1, 1000) < 0)
+                    break;
+                for (k = 0; k < c->out_count; k++)
+                    if (c->out_free[k]) {
+                        slot = k;
+                        break;
+                    }
+                waited += 1000;
+            }
+            if (slot < 0 || c->replay_len[idx] > c->out_len[slot])
+                break;
+            memcpy(c->out_map[slot], c->replay_au[idx], c->replay_len[idx]);
+            memset(&b, 0, sizeof(b));
+            memset(&pl, 0, sizeof(pl));
+            b.type = DEC_OUT_TYPE;
+            b.memory = V4L2_MEMORY_MMAP;
+            b.index = (uint32_t)slot;
+            b.length = 1;
+            b.m.planes = &pl;
+            b.m.planes[0].bytesused = (uint32_t)c->replay_len[idx];
+            b.m.planes[0].length = (uint32_t)c->out_len[slot];
+            b.timestamp.tv_sec = 0;
+            b.timestamp.tv_usec = 0;
+            if (mtkvcp_ioctl(c->vfd, VIDIOC_QBUF, &b) == 0) {
+                c->out_free[slot] = 0;
+                c->last_submit_ms = mtkvcp_now_ms();
+                submitted++;
+            }
+        }
+        mtkvcp_log("replay: closure resubmitted %d AUs", submitted);
+    }
+}
+
 /* Build MPEG-2 PS with the given temporal ref and prepend to staged au. */
 static VAStatus mtkvcp_mp2_prepend_ps(struct mtkvcp_drv *d, int ci,
                                       int temporal_ref)
@@ -1416,6 +1596,9 @@ VAStatus mtkvcp_dec_end(struct mtkvcp_drv *d, int ci)
         c->stop_sent = 0;
         c->saw_last = 0;
         mtkvcp_log("resumed after tail flush");
+        /* The drain's reset wiped the DPB; put the reference pictures back
+         * before this and later pictures reference them. */
+        mtkvcp_dec_replay(c, d, ci);
     }
     /* Hand the staged AU to the firmware (shared submit path, also
      * used for held B-frames whose headers are completed later). */
@@ -1511,6 +1694,58 @@ static VAStatus mtkvcp_dec_submit_au(struct mtkvcp_drv *d, int ci)
         c->pend[tail].in_use = 1;
         c->pend_tail = (tail + 1) % MTKVCP_MAX_SURFACES;
     }
+    /* Buffer this AU so a mid-stream drain can rebuild the firmware DPB. */
+    {
+        int ring = c->replay_next;
+        uint8_t *copy = malloc(c->au_len ? c->au_len : 1);
+
+        if (copy) {
+            memcpy(copy, c->au, c->au_len);
+            free(c->replay_au[ring]);
+            c->replay_au[ring] = copy;
+            c->replay_len[ring] = c->au_len;
+            if (c->replay_count < MTKVCP_REPLAY_MAX)
+                c->replay_count++;
+            if (c->out_fourcc == V4L2_PIX_FMT_H264 &&
+                mtkvcp_au_has_idr(c->au, c->au_len))
+                c->replay_idr = ring;
+            /* Capture what this picture references so a late drain can
+             * replay just the live reference closure. */
+            c->replay_target[ring] = c->au_target;
+            c->replay_nref[ring] = 0;
+            if (c->out_fourcc == V4L2_PIX_FMT_H264 && c->h264_pic_valid) {
+                int q;
+
+                for (q = 0; q < 16; q++) {
+                    const VAPictureH264 *rp =
+                        &c->h264_pic.ReferenceFrames[q];
+
+                    if ((rp->flags & VA_PICTURE_H264_INVALID) ||
+                        (int)rp->picture_id <= 0)
+                        continue;
+                    if (c->replay_nref[ring] < 16)
+                        c->replay_ref[ring][c->replay_nref[ring]++] =
+                            (int)rp->picture_id - 1;
+                }
+            } else if (c->out_fourcc == V4L2_PIX_FMT_HEVC &&
+                       c->hevc_pic_valid) {
+                int q;
+
+                for (q = 0; q < 15; q++) {
+                    const VAPictureHEVC *rp =
+                        &c->hevc_pic.ReferenceFrames[q];
+
+                    if ((rp->flags & VA_PICTURE_HEVC_INVALID) ||
+                        (int)rp->picture_id <= 0)
+                        continue;
+                    if (c->replay_nref[ring] < 16)
+                        c->replay_ref[ring][c->replay_nref[ring]++] =
+                            (int)rp->picture_id - 1;
+                }
+            }
+            c->replay_next = (ring + 1) % MTKVCP_REPLAY_MAX;
+        }
+    }
     d->surfaces[c->au_target].state = MTKVCP_SS_TARGET;
     c->au_target = -1;
     c->au_len = 0;
@@ -1591,11 +1826,15 @@ VAStatus mtkvcp_dec_sync(struct mtkvcp_drv *d, int si, uint64_t timeout_ns)
             mtkvcp_is_tail(d, ci, si))
             mtkvcp_dec_send_stop(&d->contexts[ci]);
         /* Ordered clients stall on an earlier held frame while the
-         * tail sits behind it: if nothing was submitted recently,
-         * this is also end-of-stream. */
+         * tail sits behind it. B-pyramid firmware holds output until
+         * the DPB fills, so the very first picture can be held before
+         * any completion has ever been attributed: gate on the client
+         * going idle, not on completed_one, or a client that blocks on
+         * the first sync never reaches the 30 s SYNC_TIMEOUT_MS with
+         * any way to flush it. */
         if (!d->contexts[ci].stop_sent &&
-            d->contexts[ci].completed_one && waited >= 6000 &&
-            mtkvcp_now_ms() - d->contexts[ci].last_submit_ms > 5000)
+            waited >= 2000 &&
+            mtkvcp_now_ms() - d->contexts[ci].last_submit_ms > 1500)
             mtkvcp_dec_send_stop(&d->contexts[ci]);
         if (budget_ms >= 0) {
             if (waited >= budget_ms)
