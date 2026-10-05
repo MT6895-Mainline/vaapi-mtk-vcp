@@ -2044,6 +2044,22 @@ static VAStatus mtkvcp_dec_submit_au(struct mtkvcp_drv *d, int ci)
                 fclose(fp);
             }
         }
+        /* Append every submitted access unit to one file. The units are
+         * Annex-B with the synthesised parameter sets in front, so the
+         * result is a decodable stream: feeding it back through another
+         * decoder says whether this framing is what the firmware is
+         * misreading, or whether the fault is elsewhere. Truncate the file
+         * before the run; this only appends. */
+        {
+            const char *ap = getenv("MTK_VCP_VA_DUMP_AU");
+            if (ap && *ap) {
+                FILE *fp = fopen(ap, "ab");
+                if (fp) {
+                    fwrite(c->au, 1, c->au_len, fp);
+                    fclose(fp);
+                }
+            }
+        }
     }
     if (c->out_fourcc == V4L2_PIX_FMT_MPEG2)
         mtkvcp_log("mp2 submit: target=%d au_len=%zu nslices=%d temp=?",

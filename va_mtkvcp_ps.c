@@ -765,7 +765,10 @@ static int mtkvcp_hevc_write_sps(const VAPictureParameterBufferHEVC *pic,
                             pos[j - 1] = t;
                         }
                 }
-                if (mtkvcp_bw_bits(&bw, 0, 1) < 0) /* inter_pred flag */
+                /* inter_ref_pic_set_prediction_flag is present only for
+                 * i != 0 (HEVC 7.3.7). Writing it for set 0 shifts every
+                 * field after it and the SPS fails to parse. */
+                if (s != 0 && mtkvcp_bw_bits(&bw, 0, 1) < 0)
                     break;
                 if (mtkvcp_bw_ue(&bw, nn) < 0 ||
                     mtkvcp_bw_ue(&bw, np) < 0)
