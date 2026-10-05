@@ -114,19 +114,28 @@ static int mtkvcp_ioctl(int fd, unsigned long req, void *arg)
     return r < 0 ? -errno : 0;
 }
 
-/* Claim the process-wide VCP session for context ci. */
+/* Take this context's own VCP decode session. */
 static VAStatus mtkvcp_claim_hw(struct mtkvcp_drv *d, int ci)
 {
-    if (d->hw_owner_ctx == ci)
+    /* The kernel has allowed concurrent VCP decoder sessions since
+     * "allow concurrent VCP decoder sessions", and two 720p60 streams are
+     * verified running together. The exclusive owner test here predates
+     * that: it made a second decode context inside one VA display fail with
+     * HW_BUSY, which is what VLC does on some runs - it opens a second
+     * context mid-playback, gets the failure, and thrashes. Sessions are per
+     * context now; the kernel arbitrates. */
+    struct mtkvcp_context *c = &d->contexts[ci];
+
+    if (c->hw_owned)
         return VA_STATUS_SUCCESS;
-    if (d->hw_owner_ctx >= 0)
-        return VA_STATUS_ERROR_HW_BUSY;
+    c->hw_owned = 1;
     d->hw_owner_ctx = ci;
     return VA_STATUS_SUCCESS;
 }
 
 static void mtkvcp_release_hw(struct mtkvcp_drv *d, int ci)
 {
+    d->contexts[ci].hw_owned = 0;
     if (d->hw_owner_ctx == ci)
         d->hw_owner_ctx = -1;
 }

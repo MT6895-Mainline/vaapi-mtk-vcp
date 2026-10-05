@@ -232,6 +232,7 @@ struct mtkvcp_context {
     int is_vpp;           /* CPU-side video post-processing (no VCP) */
     int vfd;              /* V4L2 fd, -1 = closed */
     int streaming;        /* STREAMON done (== HW owner held) */
+    int hw_owned;         /* this context holds its own VCP session */
     int error;            /* sticky: DRC or HW failure, recreate */
     /* geometry */
     int width, height;
