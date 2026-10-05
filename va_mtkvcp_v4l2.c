@@ -224,3 +224,20 @@ int mtkvcp_v4l2_subscribe(int fd, uint32_t evtype)
     sub.type = evtype;
     return mtkvcp_xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub);
 }
+
+/* Set one integer control. Vendor controls are not in the standard set, so
+ * they go through the extended-control form. */
+int mtkvcp_v4l2_s_ctrl(int fd, uint32_t id, int32_t value)
+{
+    struct v4l2_ext_control ec;
+    struct v4l2_ext_controls ecs;
+
+    memset(&ec, 0, sizeof(ec));
+    memset(&ecs, 0, sizeof(ecs));
+    ec.id = id;
+    ec.value = value;
+    ecs.ctrl_class = V4L2_CTRL_ID2WHICH(id);
+    ecs.count = 1;
+    ecs.controls = &ec;
+    return mtkvcp_xioctl(fd, VIDIOC_S_EXT_CTRLS, &ecs);
+}

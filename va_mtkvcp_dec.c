@@ -21,6 +21,60 @@
 #define DEC_CAP_TYPE V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
 #define SYNC_TIMEOUT_MS 30000
 
+/* Vendor V4L2_CID_MPEG_MTK_OPERATION_RATE is MTK_BASE+16, the same control
+ * downstream carries a client's declared decode rate in. The kernel sizes its
+ * OPP request from it: the request is a pixel rate, so a stream above the
+ * codec's 60/75 fps floor needs the real rate or the decoder is clocked too
+ * low to keep up.
+ *
+ * Nothing in this stack can supply that number by itself. No VAAPI decode
+ * structure carries a frame rate (num_units_in_tick/time_scale exist only in
+ * the encode headers), the kernel's OUTPUT timestamp is this bridge's own
+ * sequence cookie so no PTS reaches it either, and the stream's VUI is not in
+ * the buffers ffmpeg hands over - it passes parsed picture parameters and raw
+ * slice NALs, not whole Annex-B access units.
+ *
+ * So the rate is an explicit opt-in. A client that consumes frames faster than
+ * the floor - a 120/144 Hz panel, or playback at more than 1x - exports
+ * MTK_VCP_VA_OP_RATE=<fps> and the driver is asked for the step that needs.
+ * Unset or 0 leaves the driver on its floor, which is what everything before
+ * this control ran with.
+ */
+#define MTKVCP_DEC_OP_RATE_CID (V4L2_CTRL_CLASS_CODEC | 0x2010)
+
+static uint32_t mtkvcp_dec_op_rate(void)
+{
+    const char *v = getenv("MTK_VCP_VA_OP_RATE");
+    long n;
+
+    if (!v || !*v)
+        return 0;
+    n = strtol(v, NULL, 10);
+    if (n <= 0 || n > 1000)
+        return 0;
+    return (uint32_t)n;
+}
+
+/* Tell the driver the rate this session will actually consume frames at. The
+ * control is per open file handle, so it has to be set here rather than by an
+ * external v4l2-ctl. Failure is not fatal: an older kernel has no such
+ * control, and the stream then runs at the codec floor exactly as before.
+ */
+static void mtkvcp_dec_set_op_rate(struct mtkvcp_context *c)
+{
+    uint32_t rate = mtkvcp_dec_op_rate();
+    int r;
+
+    if (!rate)
+        return;
+    r = mtkvcp_v4l2_s_ctrl(c->vfd, MTKVCP_DEC_OP_RATE_CID, (int32_t)rate);
+    if (r < 0)
+        fprintf(stderr, "mtk-vcp-va: operation rate %u not accepted: %d "
+                "(kernel without the control?)\n", rate, r);
+    else
+        mtkvcp_log("operation rate %u accepted", rate);
+}
+
 static uint64_t mtkvcp_now_ms(void)
 {
     struct timespec ts;
@@ -299,6 +353,9 @@ static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
     int nbound = 0, i, r, granted;
     size_t dummy;
     VAStatus st;
+    /* Before STREAMON: the driver sizes its OPP request when the first header
+     * is parsed, which happens on the first access unit after this. */
+    mtkvcp_dec_set_op_rate(c);
     for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
         if (d->surfaces[i].in_use && d->surfaces[i].ctx == ci &&
             d->surfaces[i].kind == MTKVCP_SURF_DECODE)

@@ -484,6 +484,7 @@ int mtkvcp_v4l2_s_fmt(int fd, enum v4l2_buf_type type, uint32_t fourcc,
 int mtkvcp_v4l2_reqbufs(int fd, enum v4l2_buf_type type, int count);
 int mtkvcp_v4l2_stream(int fd, enum v4l2_buf_type type, int on);
 int mtkvcp_v4l2_subscribe(int fd, uint32_t evtype);
+int mtkvcp_v4l2_s_ctrl(int fd, uint32_t id, int32_t value);
 int mtkvcp_dma_heap_alloc(size_t size);
 int mtkvcp_dma_heap_alloc_system(size_t size);
 int mtkvcp_v4l2_reqbufs_mem(int fd, enum v4l2_buf_type type, int count,
