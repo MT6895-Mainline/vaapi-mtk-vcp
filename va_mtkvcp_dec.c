@@ -1063,6 +1063,11 @@ static int mtkvcp_complete_cap(struct mtkvcp_drv *d, int ci,
         d->surfaces[si_owner].cap_index = old_cap;
     /* old_cap (or a spare) stays queued under its holder. */
     c->completed_one = 1;
+    /* NOTE: do not checksum cap_map[idx] here. The mapping is MMAP, not
+     * dma-buf, so a CPU read at completion time sees whatever the cache
+     * holds - measured as all-zero for a stream whose frames demonstrably
+     * contain data. Any buffer-content probe has to go through the same
+     * path the client uses. */
     mtkvcp_log("complete seq=%llu -> target s%d buf=%d",
                (unsigned long long)seq, si_target + 1, idx);
     return 1;
