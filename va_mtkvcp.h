@@ -345,6 +345,12 @@ struct mtkvcp_context {
     int h264_slice_seen;
     VAPictureParameterBufferHEVC hevc_pic;
     int hevc_pic_valid;
+    /* Last picture params the synthesised sets were built from, and whether
+     * any were sent yet. MTK_VCP_VA_PS_ONCE uses these to send VPS/SPS/PPS
+     * only when they change rather than on every access unit - the kernel
+     * path sends the stream's own sets, which appear once. */
+    VAPictureParameterBufferHEVC hevc_ps_last;
+    int hevc_ps_sent;
     VAPictureParameterBufferMPEG2 mp2_pic;
     int mp2_pic_valid;
     VAIQMatrixBufferMPEG2 mp2_iq;

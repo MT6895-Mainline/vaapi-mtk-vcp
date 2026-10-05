@@ -55,6 +55,18 @@ static uint32_t mtkvcp_dec_op_rate(void)
     return (uint32_t)n;
 }
 
+/* Send the synthesised VPS/SPS/PPS only when the picture parameters change,
+ * instead of with every access unit. Diagnostic: the kernel path sends the
+ * stream's own sets, which appear once per sequence. */
+static int mtkvcp_ps_once(void)
+{
+    static int cached = -1;
+
+    if (cached < 0)
+        cached = getenv("MTK_VCP_VA_PS_ONCE") ? 1 : 0;
+    return cached;
+}
+
 /* Tell the driver the rate this session will actually consume frames at. The
  * control is per open file handle, so it has to be set here rather than by an
  * external v4l2-ctl. Failure is not fatal: an older kernel has no such
@@ -1590,7 +1602,7 @@ VAStatus mtkvcp_dec_end(struct mtkvcp_drv *d, int ci)
             size_t flen = 0;
             int pps_ids[8], nids = 0, bad = 0;
             uint8_t ps[2048];
-            int pslen, k;
+            int pslen = 0, k;
             if (c->au_error || c->custom_scaling || !c->hevc_pic_valid) {
                 mtkvcp_log("raw HEVC picture without usable pic params "
                            "(err=%d scal=%d pic=%d) -> fatal",
@@ -1661,18 +1673,34 @@ VAStatus mtkvcp_dec_end(struct mtkvcp_drv *d, int ci)
             if (!bad) {
                 int prof = d->configs[c->config].profile ==
                            VAProfileHEVCMain10 ? 2 : 1;
-                pslen = mtkvcp_hevc_build_ps(&c->hevc_pic, prof,
-                                             c->width, c->height,
-                                             pps_ids, nids, ps,
-                                             sizeof(ps));
-                mtkvcp_log("hevc build_ps -> %d (nids=%d)", pslen,
-                           nids);
-                if (pslen < 0 || flen + (size_t)pslen > fcap)
-                    bad = 1;
-                else {
-                    memmove(framed + pslen, framed, flen);
-                    memcpy(framed, ps, (size_t)pslen);
-                    flen += (size_t)pslen;
+                /* The kernel path sends the stream's own VPS/SPS/PPS, which
+                 * appear once per sequence, not once per picture. Sending
+                 * them with every access unit is a real structural
+                 * difference; MTK_VCP_VA_PS_ONCE tests whether the firmware
+                 * re-initialises its DPB each time it sees an SPS. */
+                int send_ps = 1;
+
+                if (mtkvcp_ps_once() && c->hevc_ps_sent &&
+                    !memcmp(&c->hevc_ps_last, &c->hevc_pic,
+                            sizeof(c->hevc_pic)))
+                    send_ps = 0;
+                if (send_ps) {
+                    pslen = mtkvcp_hevc_build_ps(&c->hevc_pic, prof,
+                                                 c->width, c->height,
+                                                 pps_ids, nids, ps,
+                                                 sizeof(ps));
+                    mtkvcp_log("hevc build_ps -> %d (nids=%d)", pslen,
+                               nids);
+                    if (pslen < 0 || flen + (size_t)pslen > fcap)
+                        bad = 1;
+                    else {
+                        memmove(framed + pslen, framed, flen);
+                        memcpy(framed, ps, (size_t)pslen);
+                        flen += (size_t)pslen;
+                        memcpy(&c->hevc_ps_last, &c->hevc_pic,
+                               sizeof(c->hevc_pic));
+                        c->hevc_ps_sent = 1;
+                    }
                 }
             }
             if (bad) {
@@ -1698,7 +1726,7 @@ VAStatus mtkvcp_dec_end(struct mtkvcp_drv *d, int ci)
             size_t flen = 0;
             int pps_ids[8], nids = 0, bad = 0;
             uint8_t ps[1024];
-            int pslen;
+            int pslen = 0;
             if (c->au_error || c->custom_scaling || !c->h264_pic_valid ||
                 !c->h264_slice_seen) {
                 mtkvcp_log("raw-NAL picture without usable pic params "
@@ -2185,6 +2213,11 @@ VAStatus mtkvcp_dec_sync(struct mtkvcp_drv *d, int si, uint64_t timeout_ns)
     struct mtkvcp_surface *s = &d->surfaces[si];
     int ci = s->ctx, waited = 0, slice = 250;
     int budget_ms = timeout_ns ? (int)(timeout_ns / 1000000ull) : -1;
+    /* Which surface does the client actually wait on, and which CAPTURE
+     * buffer does it hold? A client that syncs one surface repeatedly would
+     * read a single picture even though the decoder produced distinct ones. */
+    mtkvcp_log("sync si=%d state=%d cap_index=%d", si, s->state,
+               s->cap_index);
     if (s->state == MTKVCP_SS_READY)
         return VA_STATUS_SUCCESS;
     if (s->state == MTKVCP_SS_ERROR)
