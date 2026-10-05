@@ -703,9 +703,93 @@ static int mtkvcp_hevc_write_sps(const VAPictureParameterBufferHEVC *pic,
             mtkvcp_log("HEVC PCM enabled unsupported (v1)");
             break;
         }
-        /* Empty RPS (v1): slices referencing SPS sets fail closed. */
-        if (mtkvcp_bw_ue(&bw, 0) < 0) /* num_short_term_ref_pic_sets */
-            break;
+        /* Short-term RPS.
+         *
+         * A stream whose SPS defines them (VAAPI reports
+         * num_short_term_ref_pic_sets > 0) carries only an index in each
+         * slice header, so the sets themselves have to come from here. With
+         * the count written as 0 those slices resolve no reference list at
+         * all: the first picture (intra) decodes correctly and every
+         * inter picture after it repeats it. Measured on a 2460x1080 HEVC
+         * stream from the device's own encoder (num_st_rps=1,
+         * st_rps_bits=0): frames 1..n came back identical to frame 0, while
+         * a stream that embeds its RPS in the slice header
+         * (num_st_rps=0, st_rps_bits=6) was bit-exact.
+         *
+         * VAAPI does not carry the encoder's deltas, but it does mark every
+         * DPB entry that is in the current RPS and on which side
+         * (VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE/AFTER), which is the same
+         * information. Set 0 is rebuilt from those; any further sets are
+         * written empty, which keeps the count - and therefore slice header
+         * parsing - correct.
+         */
+        {
+            uint32_t nsets = pic->num_short_term_ref_pic_sets;
+            uint32_t s;
+            int bad = 0;
+
+            if (mtkvcp_bw_ue(&bw, nsets) < 0)
+                break;
+            for (s = 0; s < nsets; s++) {
+                int32_t neg[16], pos[16];
+                int nn = 0, np = 0, i, j;
+
+                if (s == 0) {
+                    for (i = 0; i < 15; i++) {
+                        const VAPictureHEVC *r = &pic->ReferenceFrames[i];
+                        int32_t d;
+
+                        if (r->flags & VA_PICTURE_HEVC_INVALID)
+                            continue;
+                        d = r->pic_order_cnt - pic->CurrPic.pic_order_cnt;
+                        if ((r->flags &
+                             VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE) && d < 0)
+                            neg[nn++] = -d;
+                        else if ((r->flags &
+                                  VA_PICTURE_HEVC_RPS_ST_CURR_AFTER) && d > 0)
+                            pos[np++] = d;
+                    }
+                    /* The spec requires the deltas in increasing order. */
+                    for (i = 1; i < nn; i++)
+                        for (j = i; j > 0 && neg[j] < neg[j - 1]; j--) {
+                            int32_t t = neg[j];
+
+                            neg[j] = neg[j - 1];
+                            neg[j - 1] = t;
+                        }
+                    for (i = 1; i < np; i++)
+                        for (j = i; j > 0 && pos[j] < pos[j - 1]; j--) {
+                            int32_t t = pos[j];
+
+                            pos[j] = pos[j - 1];
+                            pos[j - 1] = t;
+                        }
+                }
+                if (mtkvcp_bw_bits(&bw, 0, 1) < 0) /* inter_pred flag */
+                    break;
+                if (mtkvcp_bw_ue(&bw, nn) < 0 ||
+                    mtkvcp_bw_ue(&bw, np) < 0)
+                    break;
+                for (i = 0; i < nn; i++)
+                    if (mtkvcp_bw_ue(&bw, neg[i] - 1) < 0 ||
+                        mtkvcp_bw_bits(&bw, 1, 1) < 0) { /* used_by_curr */
+                        bad = 1;
+                        break;
+                    }
+                if (bad)
+                    break;
+                for (i = 0; i < np; i++)
+                    if (mtkvcp_bw_ue(&bw, pos[i] - 1) < 0 ||
+                        mtkvcp_bw_bits(&bw, 1, 1) < 0) { /* used_by_curr */
+                        bad = 1;
+                        break;
+                    }
+                if (bad)
+                    break;
+            }
+            if (bad)
+                break;
+        }
         if (mtkvcp_bw_bits(&bw, 0, 1) < 0) /* long_term_present */
             break;
         if (mtkvcp_bw_bits(&bw, pic->slice_parsing_fields.bits

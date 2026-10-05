@@ -338,6 +338,11 @@ static void mtkvcp_dec_grow_capture(struct mtkvcp_drv *d, int ci)
 static int mtkvcp_dec_pool_size(struct mtkvcp_context *c)
 {
     int big = c->width > 1920 || c->height > 1088;
+    /* NOTE: raising the large-frame pool from 12 to 20 was tried and measured
+     * to change nothing (2460x1080: 1200 -> 1206 frames; 2560x1600: 924 -> 941
+     * over 20 s of VLC playback), so it is reverted rather than kept. The
+     * 12-vs-20 split correlating with "laggy vs smooth" was a coincidence.
+     */
     if (c->out_fourcc == V4L2_PIX_FMT_H264)
         return big ? 12 : 20;
     if (c->out_fourcc == V4L2_PIX_FMT_HEVC)
@@ -623,6 +628,18 @@ VAStatus mtkvcp_dec_render(struct mtkvcp_drv *d, int ci, int bi)
                        sizeof(c->hevc_pic)) {
             memcpy(&c->hevc_pic, b->data, sizeof(c->hevc_pic));
             c->hevc_pic_valid = 1;
+            /* num_short_term_ref_pic_sets is how many SPS-level RPS the
+             * stream defines. st_rps_bits is the bit length of a
+             * slice-embedded RPS, and is 0 when the slice references an
+             * SPS one instead. mtkvcp_hevc_write_sps() declares zero SPS
+             * RPS, so any stream with num_short_term_ref_pic_sets > 0 has
+             * slices the firmware cannot resolve a reference list for. */
+            mtkvcp_log("hevc pic: num_st_rps=%u st_rps_bits=%u "
+                       "NoPicReordering=%u max_dpb_minus1=%u",
+                       c->hevc_pic.num_short_term_ref_pic_sets,
+                       c->hevc_pic.st_rps_bits,
+                       c->hevc_pic.pic_fields.bits.NoPicReorderingFlag,
+                       c->hevc_pic.sps_max_dec_pic_buffering_minus1);
         } else if (c->out_fourcc == V4L2_PIX_FMT_MPEG2 &&
                    (size_t)b->size * (size_t)b->num_elements >=
                        sizeof(c->mp2_pic)) {
