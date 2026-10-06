@@ -603,8 +603,13 @@ static int mtkvcp_hevc_write_vps(int profile_idc, int level_idc,
             break;
         if (mtkvcp_bw_ue(&bw, 0) < 0) /* num_layer_sets-1 */
             break;
-        if (mtkvcp_bw_bits(&bw, 1, 1) < 0) /* layer_id_included */
-            break;
+        /* layer_id_included_flag[i][j] sits inside the
+         * "for (i = 1; i <= vps_num_layer_sets_minus1; i++)" loop and is
+         * absent when num_layer_sets_minus1 is 0. Writing it here shifted
+         * every later field by one bit, so a parser read the rbsp stop bit as
+         * vps_extension_flag and ran off the end of the NAL - measured with
+         * ffmpeg as "Overread VPS by 8 bits" followed by "SPS 0 does not
+         * exist" on every access unit this bridge submitted. */
         if (mtkvcp_bw_bits(&bw, 0, 1) < 0) /* timing_info */
             break;
         if (mtkvcp_bw_bits(&bw, 0, 1) < 0) /* extension */
@@ -801,6 +806,12 @@ static int mtkvcp_hevc_write_sps(const VAPictureParameterBufferHEVC *pic,
         if (mtkvcp_bw_bits(&bw, pic->pic_fields.bits
                                  .strong_intra_smoothing_enabled_flag,
                            1) < 0)
+            break;
+        /* vui_parameters_present_flag comes before sps_extension_present_flag
+         * and was missing, which shifted the extension flag onto the rbsp stop
+         * bit: parsers then took the "extension present" branch and overread
+         * the SPS. */
+        if (mtkvcp_bw_bits(&bw, 0, 1) < 0) /* vui_parameters_present */
             break;
         if (mtkvcp_bw_bits(&bw, 0, 1) < 0) /* extension_present */
             break;
