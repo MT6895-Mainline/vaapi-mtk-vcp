@@ -257,12 +257,43 @@ static int mtkvcp_qbuf_cap(struct mtkvcp_context *c, int idx)
 /* Largest CAPTURE pool worth allocating for this frame: bounded by the
  * kernel's vb2 limit and a memory budget, but always enough for the
  * baseline plus the reserve. */
+/* Pool sizing knobs, so the reserve can be A/B-ed without a rebuild.
+ * MTK_VCP_VA_CAP_RESERVE (default MTKVCP_CAP_RESERVE) and
+ * MTK_VCP_VA_CAP_MAX (default MTKVCP_MAX_CAP_BUFS). */
+static int mtkvcp_cap_reserve(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *v = getenv("MTK_VCP_VA_CAP_RESERVE");
+
+        cached = v ? atoi(v) : MTKVCP_CAP_RESERVE;
+        if (cached < 0)
+            cached = 0;
+    }
+    return cached;
+}
+
+static int mtkvcp_cap_max(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *v = getenv("MTK_VCP_VA_CAP_MAX");
+
+        cached = v ? atoi(v) : MTKVCP_MAX_CAP_BUFS;
+        if (cached < 1)
+            cached = 1;
+    }
+    return cached;
+}
+
 static int mtkvcp_dec_max_pool(struct mtkvcp_context *c)
 {
     size_t stride = c->cap_stride > 0 ? (size_t)c->cap_stride : (size_t)c->width;
     size_t bh = c->cap_bh > 0 ? (size_t)c->cap_bh : (size_t)c->height;
     size_t frame = stride * bh * 3u / 2u;
-    int max = MTKVCP_MAX_CAP_BUFS;
+    int max = mtkvcp_cap_max();
 
     if (frame) {
         int by_mem = (int)(MTKVCP_CAP_BUDGET / frame);
@@ -270,8 +301,8 @@ static int mtkvcp_dec_max_pool(struct mtkvcp_context *c)
         if (by_mem < max)
             max = by_mem;
     }
-    if (max < MTKVCP_CAP_RESERVE + 2)
-        max = MTKVCP_CAP_RESERVE + 2;
+    if (max < mtkvcp_cap_reserve() + 2)
+        max = mtkvcp_cap_reserve() + 2;
     return max;
 }
 
@@ -297,14 +328,14 @@ static void mtkvcp_dec_grow_capture(struct mtkvcp_drv *d, int ci)
             d->surfaces[i].kind == MTKVCP_SURF_DECODE)
             bound++;
     /* +1 for the surface about to bind. */
-    need = bound + 1 + MTKVCP_CAP_RESERVE;
+    need = bound + 1 + mtkvcp_cap_reserve();
     {
         int max = mtkvcp_dec_max_pool(c);
 
         if (need > max)
             need = max;
     }
-    if (need <= c->cap_count || c->cap_count >= MTKVCP_MAX_CAP_BUFS)
+    if (need <= c->cap_count || c->cap_count >= mtkvcp_cap_max())
         return;
     memset(&g, 0, sizeof(g));
     g.type = DEC_CAP_TYPE;
@@ -388,8 +419,8 @@ static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
             bound[nbound++] = i;
     c->pool_size = mtkvcp_dec_pool_size(c);
     /* Pre-bound render targets each need their own destination. */
-    if (nbound + MTKVCP_CAP_RESERVE + 1 > c->pool_size)
-        c->pool_size = nbound + MTKVCP_CAP_RESERVE + 1;
+    if (nbound + mtkvcp_cap_reserve() + 1 > c->pool_size)
+        c->pool_size = nbound + mtkvcp_cap_reserve() + 1;
     {
         int max = mtkvcp_dec_max_pool(c);
 
@@ -514,6 +545,9 @@ static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
 static void mtkvcp_drop_pending(struct mtkvcp_context *c, int si);
 static int mtkvcp_dec_pump(struct mtkvcp_drv *d, int ci, int block,
                            int timeout_ms);
+static int mtkvcp_dec_recover(struct mtkvcp_drv *d, int ci);
+static int mtkvcp_dec_flush_reset(struct mtkvcp_drv *d, int ci);
+static int mtkvcp_wedge_recover(void);
 
 VAStatus mtkvcp_dec_begin(struct mtkvcp_drv *d, int ci, int si)
 {
@@ -2005,9 +2039,17 @@ static VAStatus mtkvcp_dec_submit_au(struct mtkvcp_drv *d, int ci)
             break;
         }
     if (slot < 0) {
-        int waited = 0;
-        while (slot < 0 && waited < 15000 && !c->error) {
-            r = mtkvcp_dec_pump(d, ci, 1, 1000);
+        /* A wedge is the firmware no longer retiring access units: the ring
+         * never refills and the client blocks here. Waiting the full 15 s and
+         * then failing the session is the worst of both outcomes - measured as
+         * 15 s and 30 s stalls followed by a decoder that returns
+         * VA_STATUS_ERROR_DECODING_ERROR for the rest of its life. Break the
+         * ring instead, and keep the total budget short enough that a wedge
+         * costs a hiccup rather than a session. */
+        int waited = 0, tried = 0;
+
+        while (slot < 0 && waited < 3000 && !c->error) {
+            r = mtkvcp_dec_pump(d, ci, 1, 50);
             if (r < 0)
                 break;
             for (i = 0; i < c->out_count; i++)
@@ -2015,15 +2057,25 @@ static VAStatus mtkvcp_dec_submit_au(struct mtkvcp_drv *d, int ci)
                     slot = i;
                     break;
                 }
-            waited += 1000;
+            waited += 50;
+            if (slot < 0 && waited >= 400 && tried < 2 &&
+                mtkvcp_wedge_recover()) {
+                tried++;
+                mtkvcp_log("submit: ring stalled %d ms, recovering (%d)",
+                           waited, tried);
+                if (mtkvcp_dec_recover(d, ci) < 0)
+                    break;
+            }
         }
         if (slot < 0) {
-            mtkvcp_log("no OUTPUT slot freed after %dms -> fatal",
-                       waited);
+            mtkvcp_log("no OUTPUT slot freed after %dms -> fatal", waited);
             c->au_target = -1;
             c->au_len = 0;
             return VA_STATUS_ERROR_DECODING_ERROR;
         }
+        if (tried)
+            mtkvcp_log("submit: recovered in %d ms (%d attempt%s)",
+                       waited, tried, tried == 1 ? "" : "s");
     }
     if (c->au_len > c->out_len[slot]) {
         c->au_target = -1;
@@ -2211,6 +2263,121 @@ static void mtkvcp_dec_send_stop(struct mtkvcp_context *c)
         c->stop_sent = 1;
         mtkvcp_log("STOP sent (tail flush)");
     }
+}
+
+/* Whether the submit path may break a stalled OUTPUT ring itself. Set
+ * MTK_VCP_VA_WEDGE_RECOVER=0 to get the old behaviour (wait 15 s, then fail
+ * the session) for an A/B. */
+static int mtkvcp_wedge_recover(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *v = getenv("MTK_VCP_VA_WEDGE_RECOVER");
+
+        cached = (v && *v == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+/* Break a stalled OUTPUT ring with the vendor's flush.
+ *
+ * The kernel turns "STOP -> completed drain -> START" into
+ * mtk_vcp_vdec_reset(decoder, false): AP_IPIMSG_DEC_RESET with drain_type 0,
+ * i.e. the firmware drops its DPB and every access unit still in flight and
+ * treats the next picture as a fresh sequence. That is the flush the vendor
+ * driver issues when its OUTPUT queue is stopped (vdec_vcp_if.c: VDEC_FLUSH),
+ * and the drain has to complete for it to happen at all.
+ *
+ * Two things have to be handed back for the drain to finish. The pending
+ * records go first: a completion that matches no pending record is
+ * unattributed, and the pump already returns those straight to the driver.
+ * Then the CAPTURE buffers the client is holding - the client is blocked in
+ * EndPicture while this runs and cannot recycle anything, and with the pool
+ * full the firmware has nowhere to put the reorder tail, so it never reports
+ * LAST (measured dstq=0 during the drain). These are frames a stalled session
+ * is abandoning anyway.
+ *
+ * Called with d->lock held, from the submit path.
+ */
+static int mtkvcp_dec_flush_reset(struct mtkvcp_drv *d, int ci)
+{
+    struct mtkvcp_context *c = &d->contexts[ci];
+    struct v4l2_decoder_cmd cmd;
+    int i, waited = 0, ok, requeued = 0;
+
+    for (i = 0; i < MTKVCP_MAX_SURFACES; i++) {
+        struct mtkvcp_surface *s = &d->surfaces[i];
+
+        c->pend[i].in_use = 0;
+        if (!s->in_use || s->ctx != ci)
+            continue;
+        if (s->cap_index >= 0) {
+            mtkvcp_qbuf_cap(c, s->cap_index);
+            s->cap_index = -1;
+            requeued++;
+        }
+        if (s->state != MTKVCP_SS_IDLE)
+            s->state = MTKVCP_SS_IDLE;
+    }
+    mtkvcp_log("flush: pool=%d requeued=%d queued=%d", c->cap_count,
+               requeued, c->cap_queued);
+    mtkvcp_dec_send_stop(c);
+    for (;;) {
+        int k, empty = 1;
+
+        for (k = 0; k < MTKVCP_MAX_SURFACES; k++)
+            if (c->pend[k].in_use) {
+                empty = 0;
+                break;
+            }
+        if ((c->saw_last && empty) || waited >= 300 || c->error)
+            break;
+        if (mtkvcp_dec_pump(d, ci, 1, 50) < 0)
+            break;
+        waited += 50;
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cmd = V4L2_DEC_CMD_START;
+    ok = mtkvcp_ioctl(c->vfd, VIDIOC_DECODER_CMD, &cmd) == 0;
+    if (!ok) {
+        /* Draining but not stopped: the kernel refuses START until the
+         * queue is restarted. */
+        if (mtkvcp_dec_kick_capture(d, ci) == 0) {
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.cmd = V4L2_DEC_CMD_START;
+            ok = mtkvcp_ioctl(c->vfd, VIDIOC_DECODER_CMD, &cmd) == 0;
+        }
+    }
+    if (!ok) {
+        mtkvcp_log("flush: START refused after %d ms", waited);
+        return -1;
+    }
+    mtkvcp_log("flush: drain %s after %d ms",
+               c->saw_last ? "complete" : "abandoned", waited);
+    c->stop_sent = 0;
+    c->saw_last = 0;
+    c->resume_at_ms = 0;
+    c->hevc_ps_sent = 0;      /* the firmware dropped its parameter sets */
+    c->replay_count = 0;
+    c->replay_idr = -1;
+    for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
+        c->pend[i].in_use = 0;
+    return 0;
+}
+
+/* Break a stalled OUTPUT ring: the firmware has stopped retiring access units,
+ * so the ring never refills and the client blocks in Begin/EndPicture until a
+ * watchdog gives up (measured: 15 s and 30 s stalls, then a session that keeps
+ * returning VA_STATUS_ERROR_DECODING_ERROR for the rest of its life). This is
+ * the same reset as the proactive one, forced through a CAPTURE restart.
+ */
+static int mtkvcp_dec_recover(struct mtkvcp_drv *d, int ci)
+{
+    int r = mtkvcp_dec_flush_reset(d, ci);
+
+    mtkvcp_log("recover: ring broken, queue restarted (%d)", r);
+    return r;
 }
 
 /* True if si's picture is the newest still pending. */

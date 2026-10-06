@@ -54,9 +54,15 @@
 /* CAPTURE buffers kept queued in the kernel at all times. The m2m job
  * only runs while a destination buffer is queued, so this slack is what
  * lets decoding continue when the client's display holds the rest. */
-#define MTKVCP_CAP_RESERVE    3
-/* One vb2 queue holds at most VB2_MAX_FRAME buffers. */
-#define MTKVCP_MAX_CAP_BUFS   32
+#define MTKVCP_CAP_RESERVE    8
+/* The decoder's CAPTURE queue now advertises max_num_buffers = 64
+ * (mtk_vcp_vdec_drv.c queue_init), so the pool can hold the client's surfaces
+ * *plus* the reserve the drain needs. The old default, VB2_MAX_FRAME = 32, was
+ * reached by VLC's own pool and left no slack, which is why a V4L2 drain could
+ * not complete at a seek and the vendor flush reset was unreachable without
+ * dropping the client's buffers.
+ */
+#define MTKVCP_MAX_CAP_BUFS   48
 /* Ceiling for the CAPTURE pool (one buffer per client surface plus slack;
  * a 4K60 client holding the whole budget would be ~256 MB). */
 #define MTKVCP_CAP_BUDGET     (256u * 1024u * 1024u)
