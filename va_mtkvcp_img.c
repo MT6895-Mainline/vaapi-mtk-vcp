@@ -197,8 +197,8 @@ static int mtkvcp_export_stride_for(unsigned int fourcc, int width)
  * pixels (vaGetImage / vaDeriveImage) has to - that is the whole trade.
  * MM21 is 16x32 luma tiles and 16x16 chroma tiles in raster order.
  */
-static void mtkvcp_detile_mm21(uint8_t *dst, int dstride, const uint8_t *src,
-                               int sstride, int height, int tile_h)
+void mtkvcp_detile_mm21(uint8_t *dst, int dstride, const uint8_t *src,
+                        int sstride, int height, int tile_h)
 {
     int x, y;
 

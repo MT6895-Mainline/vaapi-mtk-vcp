@@ -455,6 +455,12 @@ void mtkvcp_prof_frame(struct mtkvcp_context *c, const char *tag);
 int mtkvcp_rgb_input_mode(void);
 /* Tiled decode CAPTURE, opt-in (see mtkvcp_tiled_capture). */
 int mtkvcp_tiled_capture(void);
+/* Linearise one plane of the firmware's MM21/MT2T tiles: 16x32 luma tiles and
+ * 16x16 chroma tiles, both in raster tile order. The chroma plane is passed
+ * with tile_h 16 and half the height.
+ */
+void mtkvcp_detile_mm21(uint8_t *dst, int dstride, const uint8_t *src,
+                        int sstride, int height, int tile_h);
 /* The layout MM21/MT2T use, as a DRM format modifier: MediaTek is vendor
  * 0x0b and 16L32S is tile layout 1 in the low byte. A consumer that does not
  * know it must reject the buffer rather than read tiles as if they were rows.

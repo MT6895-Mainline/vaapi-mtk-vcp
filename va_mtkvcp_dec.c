@@ -2556,15 +2556,36 @@ static void mtkvcp_dec_stage_unread(struct mtkvcp_drv *d, int ci)
         if (!s->enc_data)
             continue;
         src = c->cap_map[s->cap_index];
-        for (y = 0; y < (size_t)s->height; y++)
-            memcpy(s->enc_data + y * (size_t)c->cap_stride,
-                   src + y * (size_t)c->cap_stride,
-                   (size_t)c->cap_stride);
-        for (y = 0; y < (size_t)s->height / 2; y++)
-            memcpy(s->enc_data +
-                       ((size_t)s->height + y) * (size_t)c->cap_stride,
-                   src + ((size_t)c->cap_bh + y) * (size_t)c->cap_stride,
-                   (size_t)c->cap_stride);
+        if (c->cap_tiled) {
+            /* Plane 0 is only the luma tiles and the chroma tiles are a
+             * second mapping, so the row copies below would walk straight
+             * off the end of plane 0. Expand both planes instead, into the
+             * layout the staged reader above expects.
+             */
+            const uint8_t *uv = c->cap_map_uv[s->cap_index];
+
+            if (!uv) {
+                free(s->enc_data);
+                s->enc_data = NULL;
+                continue;
+            }
+            mtkvcp_detile_mm21(s->enc_data, c->cap_stride, src,
+                               c->cap_stride, s->height, 32);
+            mtkvcp_detile_mm21(s->enc_data +
+                                   (size_t)c->cap_stride * s->height,
+                               c->cap_stride, uv, c->cap_stride,
+                               s->height / 2, 16);
+        } else {
+            for (y = 0; y < (size_t)s->height; y++)
+                memcpy(s->enc_data + y * (size_t)c->cap_stride,
+                       src + y * (size_t)c->cap_stride,
+                       (size_t)c->cap_stride);
+            for (y = 0; y < (size_t)s->height / 2; y++)
+                memcpy(s->enc_data +
+                           ((size_t)s->height + y) * (size_t)c->cap_stride,
+                       src + ((size_t)c->cap_bh + y) * (size_t)c->cap_stride,
+                       (size_t)c->cap_stride);
+        }
         s->enc_size = need;
         s->enc_stride = c->cap_stride;
         s->kind = MTKVCP_SURF_DECODE_STAGED;
