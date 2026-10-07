@@ -217,14 +217,23 @@ int mtkvcp_rgb_input_mode(void)
  *
  * The gain reaches any client that does not read pixels - a zero-copy
  * -hwaccel_output_format vaapi chain, or a tile-aware consumer of
- * vaExportSurfaceHandle, which is what VLC does (it exports the surface to a
- * dma-buf and hands it to the display). A client that calls
- * vaGetImage()/vaDeriveImage() gets the same detile, just moved into this
- * process, so it is no worse off but no better either.
+ * vaExportSurfaceHandle, which is what VLC does (it exports the surface as a
+ * dma-buf carrying DRM_FORMAT_MOD_MTK_16L_32S_TILE and hands it to the
+ * display). A client that calls vaGetImage()/vaDeriveImage() gets the same
+ * detile, just moved into this process.
  *
  * MTK_VCP_VA_CAPTURE selects the layout:
- *   mm21/tiled/1       -> tiled
- *   unset/0/off/nv12   -> linear NV12/P010 (default for now)
+ *   unset/mm21/tiled/1 -> tiled   (default)
+ *   0/off/nv12         -> linear NV12/P010
+ *
+ * The opt-out is not a fallback for a broken path but for a broken *client*.
+ * Tiled capture puts the decoder's reference frames in the client's own
+ * CAPTURE buffers, so the client has to keep its whole DPB queued. A client
+ * that holds frames while it reads them back - ffmpeg without
+ * -hwaccel_output_format vaapi - drops the firmware below its DPB, and it
+ * answers by timing out ("decode failed: -110") and taking the VCP down with
+ * it. That is reproducible on any stream with B-frames, so a readback client
+ * should be run with MTK_VCP_VA_CAPTURE=nv12.
  */
 int mtkvcp_tiled_capture(void)
 {
@@ -232,14 +241,15 @@ int mtkvcp_tiled_capture(void)
     const char *v;
     if (cached >= 0)
         return cached;
-    cached = 0;
+    cached = 1;
     v = getenv("MTK_VCP_VA_CAPTURE");
     if (v && *v) {
-        if (!strcmp(v, "mm21") || !strcmp(v, "tiled") || !strcmp(v, "1"))
-            cached = 1;
-        else if (strcmp(v, "0") && strcmp(v, "off") && strcmp(v, "nv12"))
+        if (!strcmp(v, "0") || !strcmp(v, "off") || !strcmp(v, "nv12") ||
+            !strcmp(v, "linear"))
+            cached = 0;
+        else if (strcmp(v, "mm21") && strcmp(v, "tiled") && strcmp(v, "1"))
             fprintf(stderr, "mtk-vcp-va: MTK_VCP_VA_CAPTURE=%s not "
-                    "recognised, using NV12\n", v);
+                    "recognised, using tiled\n", v);
     }
     return cached;
 }
