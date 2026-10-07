@@ -148,17 +148,78 @@ static void mtkvcp_unmap_all(struct mtkvcp_context *c)
             close(c->cap_export[i] - 1);
             c->cap_export[i] = 0;
         }
+        if (c->cap_export_uv[i]) {
+            close(c->cap_export_uv[i] - 1);
+            c->cap_export_uv[i] = 0;
+        }
     }
     for (i = 0; i < MTKVCP_OUT_BUFS_DEC; i++)
         if (c->out_map[i]) {
             munmap(c->out_map[i], c->out_len[i]);
             c->out_map[i] = NULL;
         }
-    for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
+    for (i = 0; i < MTKVCP_MAX_SURFACES; i++) {
         if (c->cap_map[i]) {
             munmap(c->cap_map[i], c->cap_len[i]);
             c->cap_map[i] = NULL;
         }
+        if (c->cap_map_uv[i]) {
+            munmap(c->cap_map_uv[i], c->cap_len_uv[i]);
+            c->cap_map_uv[i] = NULL;
+        }
+    }
+    free(c->tile_scratch);
+    c->tile_scratch = NULL;
+    c->tile_scratch_sz = 0;
+}
+
+/* QUERYBUF + mmap one CAPTURE buffer. Tiled capture has a second, separate
+ * V4L2 plane holding the chroma tiles; the linear path has one.
+ */
+static int mtkvcp_map_cap(struct mtkvcp_context *c, int idx)
+{
+    struct v4l2_buffer b;
+    struct v4l2_plane pl[2];
+    int np = c->cap_planes > 1 ? 2 : 1;
+
+    memset(&b, 0, sizeof(b));
+    memset(pl, 0, sizeof(pl));
+    b.type = DEC_CAP_TYPE;
+    b.memory = V4L2_MEMORY_MMAP;
+    b.index = (uint32_t)idx;
+    b.length = (uint32_t)np;
+    b.m.planes = pl;
+    if (mtkvcp_ioctl(c->vfd, VIDIOC_QUERYBUF, &b) < 0)
+        return -1;
+    c->cap_len[idx] = pl[0].length;
+    c->cap_map[idx] = mmap(NULL, pl[0].length, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, c->vfd, pl[0].m.mem_offset);
+    if (c->cap_map[idx] == MAP_FAILED) {
+        c->cap_map[idx] = NULL;
+        return -1;
+    }
+    if (np < 2)
+        return 0;
+    c->cap_len_uv[idx] = pl[1].length;
+    c->cap_map_uv[idx] = mmap(NULL, pl[1].length, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, c->vfd, pl[1].m.mem_offset);
+    if (c->cap_map_uv[idx] == MAP_FAILED) {
+        c->cap_map_uv[idx] = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static void mtkvcp_unmap_cap(struct mtkvcp_context *c, int idx)
+{
+    if (c->cap_map[idx]) {
+        munmap(c->cap_map[idx], c->cap_len[idx]);
+        c->cap_map[idx] = NULL;
+    }
+    if (c->cap_map_uv[idx]) {
+        munmap(c->cap_map_uv[idx], c->cap_len_uv[idx]);
+        c->cap_map_uv[idx] = NULL;
+    }
 }
 
 VAStatus mtkvcp_dec_create(struct mtkvcp_drv *d, int ci)
@@ -239,14 +300,15 @@ VAStatus mtkvcp_dec_create(struct mtkvcp_drv *d, int ci)
 static int mtkvcp_qbuf_cap(struct mtkvcp_context *c, int idx)
 {
     struct v4l2_buffer b;
-    struct v4l2_plane pl;
+    struct v4l2_plane pl[2];
+    int np = c->cap_planes > 1 ? 2 : 1;
     memset(&b, 0, sizeof(b));
-    memset(&pl, 0, sizeof(pl));
+    memset(pl, 0, sizeof(pl));
     b.type = DEC_CAP_TYPE;
     b.memory = V4L2_MEMORY_MMAP;
     b.index = (uint32_t)idx;
-    b.length = 1;
-    b.m.planes = &pl;
+    b.length = (uint32_t)np;
+    b.m.planes = pl;
     int r = mtkvcp_ioctl(c->vfd, VIDIOC_QBUF, &b);
 
     if (r == 0)
@@ -352,27 +414,11 @@ static void mtkvcp_dec_grow_capture(struct mtkvcp_drv *d, int ci)
     }
     for (i = 0; i < (int)cb.count; i++) {
         int idx = (int)cb.index + i;
-        struct v4l2_buffer b;
-        struct v4l2_plane pl;
 
         if (idx < 0 || idx >= MTKVCP_MAX_SURFACES)
             break;
-        memset(&b, 0, sizeof(b));
-        memset(&pl, 0, sizeof(pl));
-        b.type = DEC_CAP_TYPE;
-        b.memory = V4L2_MEMORY_MMAP;
-        b.index = (uint32_t)idx;
-        b.length = 1;
-        b.m.planes = &pl;
-        if (mtkvcp_ioctl(c->vfd, VIDIOC_QUERYBUF, &b) < 0)
+        if (mtkvcp_map_cap(c, idx) < 0)
             break;
-        c->cap_len[idx] = pl.length;
-        c->cap_map[idx] = mmap(NULL, pl.length, PROT_READ | PROT_WRITE,
-                               MAP_SHARED, c->vfd, pl.m.mem_offset);
-        if (c->cap_map[idx] == MAP_FAILED) {
-            c->cap_map[idx] = NULL;
-            break;
-        }
         if (mtkvcp_qbuf_cap(c, idx) < 0)
             break;
         c->cap_count = idx + 1;
@@ -430,8 +476,8 @@ static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
     st = mtkvcp_claim_hw(d, ci);
     if (st != VA_STATUS_SUCCESS)
         return st;
-    r = mtkvcp_v4l2_s_fmt(c->vfd, DEC_CAP_TYPE, c->cap_fourcc,
-                          c->width, c->height, &dummy);
+    r = mtkvcp_v4l2_s_fmt_planes(c->vfd, DEC_CAP_TYPE, c->cap_fourcc,
+                                 c->width, c->height, c->cap_planes, &dummy);
     mtkvcp_log("CAP S_FMT -> sizeimage=%zu", dummy);
     if (r < 0) {
         mtkvcp_release_hw(d, ci);
@@ -471,26 +517,7 @@ static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
         d->surfaces[bound[i]].state = MTKVCP_SS_IDLE;
     }
     for (i = 0; i < c->pool_size; i++) {
-        struct v4l2_buffer b;
-        struct v4l2_plane pl;
-        memset(&b, 0, sizeof(b));
-        memset(&pl, 0, sizeof(pl));
-        b.type = DEC_CAP_TYPE;
-        b.memory = V4L2_MEMORY_MMAP;
-        b.index = (uint32_t)i;
-        b.length = 1;
-        b.m.planes = &pl;
-        if (mtkvcp_ioctl(c->vfd, VIDIOC_QUERYBUF, &b) < 0) {
-            mtkvcp_unmap_all(c);
-            mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
-            mtkvcp_release_hw(d, ci);
-            return VA_STATUS_ERROR_ALLOCATION_FAILED;
-        }
-        c->cap_len[i] = pl.length;
-        c->cap_map[i] = mmap(NULL, pl.length, PROT_READ | PROT_WRITE,
-                             MAP_SHARED, c->vfd, pl.m.mem_offset);
-        if (c->cap_map[i] == MAP_FAILED) {
-            c->cap_map[i] = NULL;
+        if (mtkvcp_map_cap(c, i) < 0) {
             mtkvcp_unmap_all(c);
             mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
             mtkvcp_release_hw(d, ci);
@@ -915,14 +942,15 @@ static int mtkvcp_dec_renegotiate(struct mtkvcp_drv *d, int ci)
             close(c->cap_export[i] - 1);
             c->cap_export[i] = 0;
         }
+        if (c->cap_export_uv[i]) {
+            close(c->cap_export_uv[i] - 1);
+            c->cap_export_uv[i] = 0;
+        }
     }
     mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 0);
     mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
     for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
-        if (c->cap_map[i]) {
-            munmap(c->cap_map[i], c->cap_len[i]);
-            c->cap_map[i] = NULL;
-        }
+        mtkvcp_unmap_cap(c, i);
     {
         struct v4l2_format f;
         memset(&f, 0, sizeof(f));
@@ -931,7 +959,7 @@ static int mtkvcp_dec_renegotiate(struct mtkvcp_drv *d, int ci)
         f.fmt.pix_mp.height = g.fmt.pix_mp.height;
         f.fmt.pix_mp.pixelformat = c->cap_fourcc;
         f.fmt.pix_mp.field = V4L2_FIELD_NONE;
-        f.fmt.pix_mp.num_planes = 1;
+        f.fmt.pix_mp.num_planes = (uint32_t)c->cap_planes;
         r = mtkvcp_ioctl(c->vfd, VIDIOC_S_FMT, &f);
         if (r < 0)
             mtkvcp_log("renegotiate: S_FMT errno=%d", r);
@@ -973,24 +1001,8 @@ static int mtkvcp_dec_renegotiate(struct mtkvcp_drv *d, int ci)
     }
     c->cap_queued = 0;
     for (i = 0; i < c->pool_size; i++) {
-        struct v4l2_buffer b;
-        struct v4l2_plane pl;
-        memset(&b, 0, sizeof(b));
-        memset(&pl, 0, sizeof(pl));
-        b.type = DEC_CAP_TYPE;
-        b.memory = V4L2_MEMORY_MMAP;
-        b.index = (uint32_t)i;
-        b.length = 1;
-        b.m.planes = &pl;
-        if (mtkvcp_ioctl(c->vfd, VIDIOC_QUERYBUF, &b) < 0)
+        if (mtkvcp_map_cap(c, i) < 0)
             return -1;
-        c->cap_len[i] = pl.length;
-        c->cap_map[i] = mmap(NULL, pl.length, PROT_READ | PROT_WRITE,
-                             MAP_SHARED, c->vfd, pl.m.mem_offset);
-        if (c->cap_map[i] == MAP_FAILED) {
-            c->cap_map[i] = NULL;
-            return -1;
-        }
         /* States (IDLE/TARGET) are kept: in-flight pictures continue
          * against the new indices; unowned slots are spares. */
         if (mtkvcp_qbuf_cap(c, i) < 0)
@@ -1142,14 +1154,14 @@ static int mtkvcp_dec_pump(struct mtkvcp_drv *d, int ci, int block,
     mtkvcp_reap_out(c);
     for (;;) {
         struct v4l2_buffer b;
-        struct v4l2_plane pl;
+        struct v4l2_plane pl[2];
         int r;
         memset(&b, 0, sizeof(b));
-        memset(&pl, 0, sizeof(pl));
+        memset(pl, 0, sizeof(pl));
         b.type = DEC_CAP_TYPE;
         b.memory = V4L2_MEMORY_MMAP;
-        b.length = 1;
-        b.m.planes = &pl;
+        b.length = (uint32_t)(c->cap_planes > 1 ? 2 : 1);
+        b.m.planes = pl;
         if (!block) {
             r = mtkvcp_ioctl(c->vfd, VIDIOC_DQBUF, &b);
             if (r == -EAGAIN)

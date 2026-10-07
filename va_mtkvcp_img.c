@@ -192,6 +192,25 @@ static int mtkvcp_export_stride_for(unsigned int fourcc, int width)
     return fourcc == V4L2_PIX_FMT_P010 ? stride * 2 : stride;
 }
 
+/* Linearise the firmware's MM21/MT2T tiles. This is the walk the kernel used
+ * to do per frame; the tiled path does not pay it, so a client that reads
+ * pixels (vaGetImage / vaDeriveImage) has to - that is the whole trade.
+ * MM21 is 16x32 luma tiles and 16x16 chroma tiles in raster order.
+ */
+static void mtkvcp_detile_mm21(uint8_t *dst, int dstride, const uint8_t *src,
+                               int sstride, int height, int tile_h)
+{
+    int x, y;
+
+    for (y = 0; y < height; y++)
+        for (x = 0; x < sstride; x += 16) {
+            int off = (y / tile_h * (sstride / 16) + x / 16) * tile_h * 16;
+
+            memcpy(dst + (size_t)y * dstride + x,
+                   src + off + (y % tile_h) * 16, 16);
+        }
+}
+
 VAStatus mtkvcp_DeriveImage(VADriverContextP ctx, VASurfaceID s,
     VAImage *image)
 {
@@ -202,6 +221,7 @@ VAStatus mtkvcp_DeriveImage(VADriverContextP ctx, VASurfaceID s,
     VAStatus st;
     VAImageFormat f;
     void *base;
+    void *owned = NULL; /* linear expansion a derived image took ownership of */
     if (!image)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
     if (si < 0 || si >= MTKVCP_MAX_SURFACES)
@@ -309,6 +329,24 @@ VAStatus mtkvcp_DeriveImage(VADriverContextP ctx, VASurfaceID s,
     f.byte_order = VA_LSB_FIRST;
     f.bits_per_pixel = f.fourcc == VA_FOURCC_P010 ? 24 : 12;
     base = d->contexts[ci].cap_map[d->surfaces[si].cap_index];
+    /* A derived image is a linear view, so a tiled frame is expanded now and
+     * the image owns the result (DestroyImage frees the buffer's data). */
+    if (d->contexts[ci].cap_tiled) {
+        int st = d->contexts[ci].cap_stride, bh = d->contexts[ci].cap_bh;
+        uint8_t *lin = malloc((size_t)st * bh * 3 / 2);
+
+        if (!lin) {
+            pthread_mutex_unlock(&d->lock);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+        mtkvcp_detile_mm21(lin, st, base, st, bh, 32);
+        mtkvcp_detile_mm21(lin + (size_t)st * bh, st,
+                           d->contexts[ci].cap_map_uv[
+                                   d->surfaces[si].cap_index],
+                           st, bh / 2, 16);
+        base = lin;
+        owned = lin;
+    }
     /* bytesperline is already bytes (2 per P010 sample). UV starts
      * at the buffer height: firmware rows may exceed visible. */
     num_planes = 2;
@@ -319,11 +357,13 @@ VAStatus mtkvcp_DeriveImage(VADriverContextP ctx, VASurfaceID s,
     total = (size_t)offsets[1] * 3u / 2u;
     ii = mtkvcp_alloc_image(d);
     if (ii < 0) {
+        free(owned);
         pthread_mutex_unlock(&d->lock);
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     }
-    bi = mtkvcp_image_buffer(d, total, NULL, base);
+    bi = mtkvcp_image_buffer(d, total, owned, base);
     if (bi < 0) {
+        free(owned);
         d->images[ii].in_use = 0;
         pthread_mutex_unlock(&d->lock);
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
@@ -484,6 +524,48 @@ VAStatus mtkvcp_GetImage(VADriverContextP ctx, VASurfaceID s, int x,
     }
     src = d->contexts[ci].cap_map[d->surfaces[si].cap_index];
     dst = d->images[ii].data;
+    if (d->contexts[ci].cap_tiled) {
+        int stride = d->contexts[ci].cap_stride;
+        int bh = d->contexts[ci].cap_bh;
+        int dstride = d->images[ii].width * bpp;
+        const uint8_t *uv = d->contexts[ci].cap_map_uv[
+                                d->surfaces[si].cap_index];
+
+        if (x == 0 && y == 0 && (int)w == d->images[ii].width &&
+            (int)h == d->images[ii].height) {
+            /* Whole frame: expand straight into the client's image. Doing
+             * it via a scratch would read and write every byte twice, which
+             * is exactly the cost this path exists to avoid.
+             */
+            mtkvcp_detile_mm21(dst, dstride, src, stride, bh, 32);
+            mtkvcp_detile_mm21((uint8_t *)dst +
+                                       (size_t)dstride * d->images[ii].height,
+                               dstride, uv, stride, bh / 2, 16);
+            pthread_mutex_unlock(&d->lock);
+            return VA_STATUS_SUCCESS;
+        }
+        /* Sub-rectangle: expand into the scratch the copy below reads. */
+        {
+            size_t need = (size_t)stride * bh * 3 / 2;
+
+            if (d->contexts[ci].tile_scratch_sz < need) {
+                free(d->contexts[ci].tile_scratch);
+                d->contexts[ci].tile_scratch = malloc(need);
+                d->contexts[ci].tile_scratch_sz =
+                    d->contexts[ci].tile_scratch ? need : 0;
+            }
+            if (!d->contexts[ci].tile_scratch) {
+                pthread_mutex_unlock(&d->lock);
+                return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            }
+            mtkvcp_detile_mm21(d->contexts[ci].tile_scratch, stride, src,
+                               stride, bh, 32);
+            mtkvcp_detile_mm21((uint8_t *)d->contexts[ci].tile_scratch +
+                                       (size_t)stride * bh,
+                               stride, uv, stride, bh / 2, 16);
+            src = d->contexts[ci].tile_scratch;
+        }
+    }
     /* Luma. */
     mtkvcp_copy_rect(dst, d->images[ii].width * bpp, src,
                      d->contexts[ci].cap_stride, x, y, (int)w,
@@ -904,6 +986,97 @@ VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
     if (idx < 0 || idx >= d->contexts[ci].cap_count) {
         pthread_mutex_unlock(&d->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (d->contexts[ci].cap_tiled) {
+        /* Two separate V4L2 planes, each handed out as its own object, with
+         * the tile layout carried by the modifier so a consumer that cannot
+         * read tiles knows to reject them instead of misreading rows. */
+        struct v4l2_exportbuffer exp;
+        unsigned int st = d->contexts[ci].cap_stride;
+        unsigned int hh = d->contexts[ci].cap_bh;
+        int ten = d->contexts[ci].cap_fourcc == V4L2_PIX_FMT_MT2T;
+        int uv_fd;
+        off_t sz0, sz1;
+
+        if (!d->contexts[ci].cap_export[idx]) {
+            memset(&exp, 0, sizeof(exp));
+            exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            exp.index = (uint32_t)idx;
+            exp.plane = 0;
+            exp.flags = O_RDONLY | O_CLOEXEC;
+            if (ioctl(d->contexts[ci].vfd, VIDIOC_EXPBUF, &exp) < 0) {
+                mtkvcp_log("export^: EXPBUF plane 0 idx=%d errno=%d",
+                           idx, errno);
+                pthread_mutex_unlock(&d->lock);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
+            d->contexts[ci].cap_export[idx] = exp.fd + 1;
+        }
+        if (!d->contexts[ci].cap_export_uv[idx]) {
+            memset(&exp, 0, sizeof(exp));
+            exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            exp.index = (uint32_t)idx;
+            exp.plane = 1;
+            exp.flags = O_RDONLY | O_CLOEXEC;
+            if (ioctl(d->contexts[ci].vfd, VIDIOC_EXPBUF, &exp) < 0) {
+                mtkvcp_log("export^: EXPBUF plane 1 idx=%d errno=%d",
+                           idx, errno);
+                pthread_mutex_unlock(&d->lock);
+                return VA_STATUS_ERROR_OPERATION_FAILED;
+            }
+            d->contexts[ci].cap_export_uv[idx] = exp.fd + 1;
+        }
+        sz0 = (off_t)st * hh;
+        sz1 = sz0 / 2;
+        fd = fcntl(d->contexts[ci].cap_export[idx] - 1, F_DUPFD_CLOEXEC, 0);
+        uv_fd = fcntl(d->contexts[ci].cap_export_uv[idx] - 1,
+                      F_DUPFD_CLOEXEC, 0);
+        if (fd < 0 || uv_fd < 0) {
+            if (fd >= 0)
+                close(fd);
+            if (uv_fd >= 0)
+                close(uv_fd);
+            pthread_mutex_unlock(&d->lock);
+            return VA_STATUS_ERROR_OPERATION_FAILED;
+        }
+        memset(prime, 0, sizeof(*prime));
+        prime->fourcc = ten ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+        prime->width = (uint32_t)d->surfaces[si].width;
+        prime->height = (uint32_t)d->surfaces[si].height;
+        prime->num_objects = 2;
+        prime->objects[0].fd = fd;
+        prime->objects[0].size = (uint32_t)sz0;
+        prime->objects[0].drm_format_modifier = MTKVCP_DRM_MOD_MM21;
+        prime->objects[1].fd = uv_fd;
+        prime->objects[1].size = (uint32_t)sz1;
+        prime->objects[1].drm_format_modifier = MTKVCP_DRM_MOD_MM21;
+        if (!(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
+            prime->num_layers = 2;
+            prime->layers[0].drm_format = ten ? DRM_FORMAT_R16
+                                              : DRM_FORMAT_R8;
+            prime->layers[1].drm_format = ten ? DRM_FORMAT_GR1616
+                                              : DRM_FORMAT_GR88;
+            prime->layers[0].num_planes = 1;
+            prime->layers[1].num_planes = 1;
+            prime->layers[0].object_index[0] = 0;
+            prime->layers[1].object_index[0] = 1;
+            prime->layers[0].pitch[0] = st;
+            prime->layers[1].pitch[0] = st;
+        } else {
+            prime->num_layers = 1;
+            prime->layers[0].drm_format = ten ? DRM_FORMAT_P010
+                                              : DRM_FORMAT_NV12;
+            prime->layers[0].num_planes = 2;
+            prime->layers[0].object_index[0] = 0;
+            prime->layers[0].object_index[1] = 1;
+            prime->layers[0].pitch[0] = st;
+            prime->layers[0].pitch[1] = st;
+        }
+        mtkvcp_log("export^: tiled si=%d idx=%d %ux%u stride=%u bh=%u mod=%#llx",
+                   si, idx, prime->width, prime->height, st, hh,
+                   (unsigned long long)MTKVCP_DRM_MOD_MM21);
+        pthread_mutex_unlock(&d->lock);
+        return VA_STATUS_SUCCESS;
     }
     if (!d->contexts[ci].cap_export[idx]) {
         struct v4l2_exportbuffer exp;

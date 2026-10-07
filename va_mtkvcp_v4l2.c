@@ -158,8 +158,8 @@ int mtkvcp_v4l2_open(const char *node)
     return fd;
 }
 
-int mtkvcp_v4l2_s_fmt(int fd, enum v4l2_buf_type type,
-                             uint32_t fourcc, int w, int h,
+int mtkvcp_v4l2_s_fmt_planes(int fd, enum v4l2_buf_type type,
+                             uint32_t fourcc, int w, int h, int planes,
                              size_t *sizeimage_out)
 {
     struct v4l2_format f;
@@ -169,17 +169,26 @@ int mtkvcp_v4l2_s_fmt(int fd, enum v4l2_buf_type type,
     f.fmt.pix_mp.height = (uint32_t)h;
     f.fmt.pix_mp.pixelformat = fourcc;
     f.fmt.pix_mp.field = V4L2_FIELD_NONE;
-    f.fmt.pix_mp.num_planes = 1;
+    f.fmt.pix_mp.num_planes = (uint32_t)(planes > 0 ? planes : 1);
     /* Leave sizeimage 0: the driver negotiates a sane default
      * (and the encoder CAPTURE path floors zero proposals). */
     int r = mtkvcp_xioctl(fd, VIDIOC_S_FMT, &f);
     if (r < 0)
         return r;
-    if (f.fmt.pix_mp.pixelformat != fourcc)
+    /* The driver may legitimately pick the other family (10-bit streams
+     * always come back as MT2T/P010), so compare the layout, not the fourcc. */
+    if (planes <= 1 && f.fmt.pix_mp.pixelformat != fourcc)
         return -EINVAL;
     if (sizeimage_out)
         *sizeimage_out = f.fmt.pix_mp.plane_fmt[0].sizeimage;
     return 0;
+}
+
+int mtkvcp_v4l2_s_fmt(int fd, enum v4l2_buf_type type,
+                             uint32_t fourcc, int w, int h,
+                             size_t *sizeimage_out)
+{
+    return mtkvcp_v4l2_s_fmt_planes(fd, type, fourcc, w, h, 1, sizeimage_out);
 }
 
 /* REQBUFS for MMAP; returns granted count or negative errno. */

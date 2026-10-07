@@ -255,6 +255,16 @@ struct mtkvcp_context {
     int out_dmabuf;
     int cap_stride;           /* CAPTURE bytesperline (decode raw-out) */
     int cap_bh;               /* CAPTURE buffer height (stride rows) */
+    /* Tiled CAPTURE: the firmware's own MM21/MT2T frame buffer is handed over
+     * untouched, so the kernel does no detile. Plane 1 is a second, separate
+     * V4L2 plane mapping; the linear path leaves all of this zero. */
+    int cap_tiled;
+    int cap_planes;
+    void *cap_map_uv[MTKVCP_MAX_SURFACES];
+    size_t cap_len_uv[MTKVCP_MAX_SURFACES];
+    int cap_export_uv[MTKVCP_MAX_SURFACES]; /* cached plane-1 fd + 1 */
+    void *tile_scratch;       /* linear expansion used by vaGetImage */
+    size_t tile_scratch_sz;
     int rgb_in;               /* packed 32-bit RGB staging (VPP output and
                                * encoder raw input): the firmware converts */
     /* Where the time goes in the capture path: the VPP copy and the
@@ -443,6 +453,20 @@ void mtkvcp_prof_frame(struct mtkvcp_context *c, const char *tag);
 #define MTKVCP_RGB_ABGR32 1   /* B,G,R,X = DRM_FORMAT_ARGB8888 */
 #define MTKVCP_RGB_ARGB32 2   /* A,R,G,B */
 int mtkvcp_rgb_input_mode(void);
+/* Tiled decode CAPTURE, opt-in (see mtkvcp_tiled_capture). */
+int mtkvcp_tiled_capture(void);
+/* The layout MM21/MT2T use, as a DRM format modifier: MediaTek is vendor
+ * 0x0b and 16L32S is tile layout 1 in the low byte. A consumer that does not
+ * know it must reject the buffer rather than read tiles as if they were rows.
+ */
+#define MTKVCP_DRM_MOD_MM21 ((0x0bULL << 56) | 0x1ULL)
+/* The firmware's tile layouts. MM21 is upstream; MT2T is a vendor fourcc. */
+#ifndef V4L2_PIX_FMT_MM21
+#define V4L2_PIX_FMT_MM21 v4l2_fourcc('M', 'M', '2', '1')
+#endif
+#ifndef V4L2_PIX_FMT_MT2T
+#define V4L2_PIX_FMT_MT2T v4l2_fourcc('M', 'T', '2', 'T')
+#endif
 int mtkvcp_zerocopy_enabled(void);
 unsigned int mtkvcp_rgb_fourcc(int mode);
 int mtkvcp_rgb_stride(int width);
@@ -494,6 +518,8 @@ int mtkvcp_xioctl(int fd, unsigned long req, void *arg);
 int mtkvcp_v4l2_open(const char *node);
 int mtkvcp_v4l2_s_fmt(int fd, enum v4l2_buf_type type, uint32_t fourcc,
                       int w, int h, size_t *sizeimage_out);
+int mtkvcp_v4l2_s_fmt_planes(int fd, enum v4l2_buf_type type, uint32_t fourcc,
+                             int w, int h, int planes, size_t *sizeimage_out);
 int mtkvcp_v4l2_reqbufs(int fd, enum v4l2_buf_type type, int count);
 int mtkvcp_v4l2_stream(int fd, enum v4l2_buf_type type, int on);
 int mtkvcp_v4l2_subscribe(int fd, uint32_t evtype);
