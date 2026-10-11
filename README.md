@@ -30,7 +30,7 @@ sudo install -m 755 mtk_vcp_drv_video.so /usr/lib/dri/mtk_vcp_drv_video.so
 LIBVA_DRIVER_NAME=mtk_vcp vainfo --display drm --device /dev/dri/renderD128
 ```
 
-The default V4L2 paths are `/dev/video1` for decoding and `/dev/video0` for encoding. Set `MTK_VCP_VA_DEC_NODE` and `MTK_VCP_VA_ENC_NODE` if your system uses different nodes. Rebuild from clean sources before deploying an updated library; the Makefile tracks changes to the shared header.
+The codec nodes are found by their `video_device` names, `mtk-vcp-dec` and `mtk-vcodec-enc`, scanning `/dev/videoN` downwards (the codec probes after every other V4L2 driver, so it lands at the top). `/dev/videoN` numbering is not stable — enabling `mtk-isp` renumbers the codec behind ~170 camera nodes — so the names are the lookup key. Set `MTK_VCP_VA_DEC_NODE` and `MTK_VCP_VA_ENC_NODE` to override either node explicitly; unset, the driver falls back to `/dev/video1` and `/dev/video0`. Rebuild from clean sources before deploying an updated library; the Makefile tracks changes to the shared header.
 
 For a short FFmpeg encode smoke test:
 

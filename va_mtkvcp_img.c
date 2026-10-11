@@ -672,9 +672,14 @@ static int mtkvcp_export_unbound(struct mtkvcp_surface *s)
      * object can be imported at all; the extra columns are padding the
      * encoder crops away. */
     unsigned int px_align = s->fourcc == V4L2_PIX_FMT_P010 ? 32u : 64u;
-    aw = ((unsigned)s->width + px_align - 1u) & ~(px_align - 1u);
-    int fd = mtkvcp_v4l2_open(MTKVCP_DEC_NODE), ret = -1;
+    int fd, ret = -1;
 
+    /* The exported object is taken from the decoder's CAPTURE queue, so it
+     * must come from the very node the decode context uses: resolving each
+     * side independently once renumbered /dev/videoN apart would export a
+     * buffer the firmware never writes. */
+    aw = ((unsigned)s->width + px_align - 1u) & ~(px_align - 1u);
+    fd = mtkvcp_v4l2_open(mtkvcp_dec_node());
     if (fd < 0)
         return -1;
     /* The decoder node rounds a request down to its own alignment, so

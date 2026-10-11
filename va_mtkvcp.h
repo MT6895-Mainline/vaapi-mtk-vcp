@@ -521,6 +521,11 @@ VAStatus mtkvcp_enc_sync_surface(struct mtkvcp_drv *d, int si,
 
 /* v4l2 helpers (va_mtkvcp_v4l2.c) */
 int mtkvcp_xioctl(int fd, unsigned long req, void *arg);
+/* Resolved codec nodes: the MTK_VCP_VA_{DEC,ENC}_NODE override if set, else
+ * the node whose video_device name matches, walking /dev/videoN downwards
+ * (the codec probes last, so it is at the top), else the built-in default. */
+const char *mtkvcp_dec_node(void);
+const char *mtkvcp_enc_node(void);
 int mtkvcp_v4l2_open(const char *node);
 int mtkvcp_v4l2_s_fmt(int fd, enum v4l2_buf_type type, uint32_t fourcc,
                       int w, int h, size_t *sizeimage_out);

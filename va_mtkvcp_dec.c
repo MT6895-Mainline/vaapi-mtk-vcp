@@ -225,11 +225,8 @@ static void mtkvcp_unmap_cap(struct mtkvcp_context *c, int idx)
 VAStatus mtkvcp_dec_create(struct mtkvcp_drv *d, int ci)
 {
     struct mtkvcp_context *c = &d->contexts[ci];
-    const char *node = getenv("MTK_VCP_VA_DEC_NODE");
     int r, i;
-    if (!node || !*node)
-        node = MTKVCP_DEC_NODE;
-    c->vfd = mtkvcp_v4l2_open(node);
+    c->vfd = mtkvcp_v4l2_open(mtkvcp_dec_node());
     if (c->vfd < 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;
     /* OUTPUT carries one AU per buffer. Like the validated probes,

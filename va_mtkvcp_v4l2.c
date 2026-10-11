@@ -3,7 +3,11 @@
  * returned as negative errno. No logging here (caller decides). */
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
+#include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -12,6 +16,8 @@
 #include <linux/videodev2.h>
 #include <linux/dma-heap.h>
 #include <linux/dma-buf.h>
+
+#include "va_mtkvcp.h"
 
 /*
  * Is this fd a dma-buf rather than an ordinary file? A memfd or a plain
@@ -136,6 +142,124 @@ int mtkvcp_xioctl(int fd, unsigned long req, void *arg)
         r = ioctl(fd, req, arg);
     } while (r < 0 && errno == EINTR);
     return r < 0 ? -errno : 0;
+}
+
+/* ---- codec node discovery ---- */
+
+/* "video170" -> 170; anything else -> -1. */
+static int node_index(const char *name)
+{
+    const char *p = name;
+    int v = 0;
+
+    if (strncmp(p, "video", 5))
+        return -1;
+    p += 5;
+    if (!*p)
+        return -1;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return -1;
+        v = v * 10 + (*p - '0');
+    }
+    return v;
+}
+
+/* Descending by video index: the codec nodes probe after every other V4L2
+ * driver, so they sit at the top and are reached first. */
+static int cmp_video_desc(const void *a, const void *b)
+{
+    return node_index(*(const char *const *)b) -
+           node_index(*(const char *const *)a);
+}
+
+/* Does /sys/class/video4linux/<entry> report this video_device name? */
+static int node_name_is(const char *sysfs_entry, const char *want)
+{
+    char path[PATH_MAX], name[128];
+    ssize_t n;
+    int fd;
+
+    snprintf(path, sizeof(path), "%s/name", sysfs_entry);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    n = read(fd, name, sizeof(name) - 1);
+    close(fd);
+    if (n <= 0)
+        return 0;
+    name[n] = '\0';
+    while (n > 0 && (name[n - 1] == '\n' || name[n - 1] == '\r'))
+        name[--n] = '\0';
+    return strcmp(name, want) == 0;
+}
+
+/*
+ * Resolve one codec node. An explicit override always wins; otherwise match
+ * the video_device name against sysfs, walking the nodes from the highest
+ * index down. The index is not stable: enabling another V4L2 driver (mtk-isp
+ * registers ~170 camera nodes) renumbers every /dev/videoN after it, so the
+ * name is the only reliable key and the reverse walk makes the lookup cheap.
+ */
+static void resolve_node(char *dst, size_t dstsz, const char *env,
+                         const char *name, const char *fallback)
+{
+    const char *v = getenv(env);
+    glob_t g;
+
+    if (v && *v) {
+        snprintf(dst, dstsz, "%s", v);
+        return;
+    }
+    if (glob("/sys/class/video4linux/video*", 0, NULL, &g) == 0) {
+        size_t i;
+
+        qsort(g.gl_pathv, g.gl_pathc, sizeof(*g.gl_pathv), cmp_video_desc);
+        for (i = 0; i < g.gl_pathc; i++) {
+            const char *base = strrchr(g.gl_pathv[i], '/');
+
+            if (!base || !node_name_is(g.gl_pathv[i], name))
+                continue;
+            snprintf(dst, dstsz, "/dev/%s", base + 1);
+            break;
+        }
+        globfree(&g);
+    }
+    if (!dst[0])
+        snprintf(dst, dstsz, "%s", fallback);
+}
+
+static pthread_mutex_t node_lock = PTHREAD_MUTEX_INITIALIZER;
+static char node_path[2][64];
+static int nodes_done;
+
+static void resolve_nodes(void)
+{
+    if (nodes_done)
+        return;
+    pthread_mutex_lock(&node_lock);
+    if (!nodes_done) {
+        resolve_node(node_path[0], sizeof(node_path[0]),
+                     "MTK_VCP_VA_DEC_NODE", "mtk-vcp-dec", MTKVCP_DEC_NODE);
+        resolve_node(node_path[1], sizeof(node_path[1]),
+                     "MTK_VCP_VA_ENC_NODE", "mtk-vcodec-enc", MTKVCP_ENC_NODE);
+        mtkvcp_log("codec nodes: dec=%s enc=%s", node_path[0], node_path[1]);
+        nodes_done = 1;
+    }
+    pthread_mutex_unlock(&node_lock);
+}
+
+/* Node the decode contexts and the exported unbound surfaces must share. */
+const char *mtkvcp_dec_node(void)
+{
+    resolve_nodes();
+    return node_path[0];
+}
+
+const char *mtkvcp_enc_node(void)
+{
+    resolve_nodes();
+    return node_path[1];
 }
 
 /* Open a V4L2 node and verify it is a V4L2 M2M device. */

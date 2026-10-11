@@ -82,13 +82,10 @@ static void mtkvcp_release_hw(struct mtkvcp_drv *d, int ci)
 VAStatus mtkvcp_enc_create(struct mtkvcp_drv *d, int ci)
 {
     struct mtkvcp_context *c = &d->contexts[ci];
-    const char *node = getenv("MTK_VCP_VA_ENC_NODE");
     struct v4l2_format g;
     int r, i;
     int fw;
-    if (!node || !*node)
-        node = MTKVCP_ENC_NODE;
-    c->vfd = mtkvcp_v4l2_open(node);
+    c->vfd = mtkvcp_v4l2_open(mtkvcp_enc_node());
     if (c->vfd < 0)
         return VA_STATUS_ERROR_OPERATION_FAILED;
     if (c->rgb_in)
