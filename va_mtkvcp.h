@@ -283,6 +283,13 @@ struct mtkvcp_context {
     /* CAPTURE (decode): pool mirrors the client's render targets */
     int cap_mmap_count;
     int cap_queued;           /* CAPTURE buffers currently queued in V4L2 */
+    /* A client exported (and keeps) one dma-buf per surface before decoding
+     * - Chromium's frame pool. V4L2 pairs the n-th OUTPUT buffer with the
+     * n-th queued CAPTURE buffer, so the pool cannot rotate: each surface's
+     * own slot is queued right before its access unit, keeping the pairing
+     * exact for clients that hold the exported objects for the whole
+     * session. */
+    int cap_ondemand;
     /* Auto-resume bookkeeping after a tail flush: the kernel stays drained
      * until V4L2_DEC_CMD_START, and a client blocked on the held frames
      * never submits the access unit that used to trigger it. */
@@ -498,6 +505,10 @@ extern const uint8_t mtkvcp_mpeg2_intra_default[64];
 
 /* cross-TU entry points (caller holds d->lock) */
 VAStatus mtkvcp_dec_sync(struct mtkvcp_drv *d, int si, uint64_t timeout_ns);
+/* Attach a still-unbound surface to a decode context's CAPTURE pool so its
+ * exported dma-buf is the buffer the firmware writes into (Chromium exports
+ * its frame pool before decoding). Returns the slot, or -1. */
+int mtkvcp_dec_attach_surface(struct mtkvcp_drv *d, int si);
 int mtkvcp_alloc_image(struct mtkvcp_drv *d);
 void mtkvcp_surface_release(struct mtkvcp_drv *d, int si);
 VAStatus mtkvcp_vpp_import_surface(struct mtkvcp_drv *d, int w, int h,
