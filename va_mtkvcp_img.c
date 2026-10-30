@@ -917,6 +917,8 @@ VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
     VAStatus st;
     if (!desc)
         return VA_STATUS_ERROR_INVALID_PARAMETER;
+    mtkvcp_log("ExportSurfaceHandle si=%d mem_type=%#x flags=%#x", si + 1,
+               mem_type, flags);
     if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)
         return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
     if ((flags & ~(VA_EXPORT_SURFACE_READ_WRITE |
@@ -949,12 +951,26 @@ VAStatus mtkvcp_ExportSurfaceHandle(VADriverContextP ctx,
         pthread_mutex_unlock(&d->lock);
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
+    /* A decode client can export a surface before any picture has bound it:
+     * Chromium's frame pool exports every surface up front and then decodes
+     * into those very surfaces, expecting the exported objects to be the
+     * storage. Attach it to a decode context's CAPTURE pool first, so the
+     * export below hands out the buffer the firmware writes into. Without
+     * this the client keeps a handle on the placeholder buffer of
+     * mtkvcp_export_unbound(), which never receives a decoded frame and is
+     * all-zero - i.e. green video. */
+    if (d->surfaces[si].kind == MTKVCP_SURF_UNBOUND)
+        mtkvcp_dec_attach_surface(d, si);
     /* UNBOUND is the storage a client exports to render into; ENC_INPUT is
      * that very same storage once BeginPicture has bound it. FFmpeg's texture
      * encoder (OBS's ffmpeg_vaapi_tex) re-exports a surface after it has been
      * used, so both kinds must hand back the same dma-buf. */
     if (d->surfaces[si].kind == MTKVCP_SURF_UNBOUND ||
         d->surfaces[si].kind == MTKVCP_SURF_ENC_INPUT) {
+        mtkvcp_log("export unbound-path si=%d kind=%d ctx=%d cap_index=%d "
+                   "prime_fd=%d", si + 1, d->surfaces[si].kind,
+                   d->surfaces[si].ctx, d->surfaces[si].cap_index,
+                   d->surfaces[si].prime_fd);
         if (d->surfaces[si].prime_fd < 0 &&
             mtkvcp_export_unbound(&d->surfaces[si]) < 0) {
             pthread_mutex_unlock(&d->lock);

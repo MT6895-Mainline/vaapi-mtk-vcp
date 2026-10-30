@@ -782,14 +782,19 @@ static VAStatus mtkvcp_QueryConfigAttributes(VADriverContextP ctx,
     VAConfigAttrib *attribs, int *num_attribs)
 {
     struct mtkvcp_drv *d = mtkvcp_drv_of(ctx);
-    static const VAConfigAttribType types[] = {
+    static const VAConfigAttribType common[] = {
         VAConfigAttribRTFormat,
         VAConfigAttribMaxPictureWidth, VAConfigAttribMaxPictureHeight,
+    };
+    static const VAConfigAttribType dec_only[] = {
         VAConfigAttribDecSliceMode,
+    };
+    static const VAConfigAttribType enc_only[] = {
         VAConfigAttribEncPackedHeaders, VAConfigAttribEncInterlaced,
         VAConfigAttribEncMaxRefFrames, VAConfigAttribEncMaxSlices,
         VAConfigAttribEncSliceStructure, VAConfigAttribRateControl,
     };
+    VAConfigAttribType types[16];
     const struct mtkvcp_prof *p;
     unsigned int i, n;
     int ci = (int)id - 1;
@@ -808,11 +813,26 @@ static VAStatus mtkvcp_QueryConfigAttributes(VADriverContextP ctx,
     p = mtkvcp_find_prof(*profile, *entrypoint);
     if (!p)
         return VA_STATUS_ERROR_INVALID_CONFIG;
-    n = sizeof(types) / sizeof(types[0]);
-    if ((unsigned int)*num_attribs < n) {
-        *num_attribs = (int)n;
-        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    n = 0;
+    for (i = 0; i < sizeof(common) / sizeof(common[0]); i++)
+        types[n++] = common[i];
+    if (*entrypoint == VAEntrypointVLD) {
+        for (i = 0; i < sizeof(dec_only) / sizeof(dec_only[0]); i++)
+            types[n++] = dec_only[i];
+    } else if (*entrypoint == VAEntrypointEncSlice) {
+        for (i = 0; i < sizeof(enc_only) / sizeof(enc_only[0]); i++)
+            types[n++] = enc_only[i];
     }
+    mtkvcp_log("QueryConfigAttributes entrypoint=%d capacity=%d need=%u",
+               *entrypoint, *num_attribs, n);
+    /* The VA-API contract says a short list makes the driver report the
+     * required size, but clients in the wild size their arrays with
+     * vaMaxNumConfigAttributes() and leave the in/out count uninitialised
+     * (Chromium passes a garbage capacity here and treats any non-zero
+     * status as "profile unsupported"). Mesa writes the list without
+     * consulting the capacity, and every caller's buffer is sized by
+     * vaMaxNumConfigAttributes(), so do the same.
+     */
     for (i = 0; i < n; i++) {
         attribs[i].type = types[i];
         mtkvcp_attrib_value(p, types[i], &attribs[i].value);

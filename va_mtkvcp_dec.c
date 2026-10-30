@@ -347,6 +347,25 @@ static int mtkvcp_cap_max(void)
     return cached;
 }
 
+/* How much memory the CAPTURE pool may pin. One slot per client surface is
+ * what a pre-exporting client (Chromium) needs, and it holds ~24 of them
+ * even at 4K, i.e. ~300 MB of 4K frames, so the default has to leave room
+ * for that. MTK_VCP_VA_CAP_BUDGET_MB overrides it. */
+static unsigned int mtkvcp_cap_budget(void)
+{
+    static unsigned int cached;
+
+    if (!cached) {
+        const char *v = getenv("MTK_VCP_VA_CAP_BUDGET_MB");
+
+        cached = v ? (unsigned int)strtoul(v, NULL, 10) : 512u;
+        if (!cached)
+            cached = 512u;
+        cached *= 1024u * 1024u;
+    }
+    return cached;
+}
+
 static int mtkvcp_dec_max_pool(struct mtkvcp_context *c)
 {
     size_t stride = c->cap_stride > 0 ? (size_t)c->cap_stride : (size_t)c->width;
@@ -355,7 +374,7 @@ static int mtkvcp_dec_max_pool(struct mtkvcp_context *c)
     int max = mtkvcp_cap_max();
 
     if (frame) {
-        int by_mem = (int)(MTKVCP_CAP_BUDGET / frame);
+        int by_mem = (int)(mtkvcp_cap_budget() / frame);
 
         if (by_mem < max)
             max = by_mem;
@@ -416,7 +435,7 @@ static void mtkvcp_dec_grow_capture(struct mtkvcp_drv *d, int ci)
             break;
         if (mtkvcp_map_cap(c, idx) < 0)
             break;
-        if (mtkvcp_qbuf_cap(c, idx) < 0)
+        if (!c->cap_ondemand && mtkvcp_qbuf_cap(c, idx) < 0)
             break;
         c->cap_count = idx + 1;
         c->cap_mmap_count = idx + 1;
@@ -445,13 +464,184 @@ static int mtkvcp_dec_pool_size(struct mtkvcp_context *c)
     return 12;
 }
 
+/* Which surface (if any) already holds CAPTURE slot idx of context ci. */
+static int mtkvcp_cap_slot_owner(struct mtkvcp_drv *d, int ci, int idx)
+{
+    int i;
+
+    for (i = 0; i < MTKVCP_MAX_SURFACES; i++)
+        if (d->surfaces[i].in_use && d->surfaces[i].ctx == ci &&
+            d->surfaces[i].kind == MTKVCP_SURF_DECODE &&
+            d->surfaces[i].cap_index == idx)
+            return i;
+    return -1;
+}
+
+/* Allocate the CAPTURE pool (format, buffers, mappings) without queueing or
+ * STREAMON, so slots can be exported to a client that wants its dma-bufs
+ * before the first picture is decoded. Idempotent. */
+static VAStatus mtkvcp_dec_prepare_cap(struct mtkvcp_drv *d, int ci)
+{
+    struct mtkvcp_context *c = &d->contexts[ci];
+    size_t dummy;
+    int granted, i, r;
+
+    if (c->cap_count > 0)
+        return VA_STATUS_SUCCESS;
+    c->pool_size = mtkvcp_dec_pool_size(c);
+    /* Ask for the aligned geometry the kernel will use once the header is
+     * parsed (1080 -> 1088, 2160 -> 2176; 32-line rounding). Allocating at the visible size
+     * makes the first source-change event look like a resize, and the
+     * renegotiation that follows would tear down a pool the client has
+     * already exported. */
+    r = mtkvcp_v4l2_s_fmt_planes(c->vfd, DEC_CAP_TYPE, c->cap_fourcc,
+                                 (c->width + 31) & ~31u,
+                                 (c->height + 31) & ~31u,
+                                 c->cap_planes, &dummy);
+    if (r < 0)
+        return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
+    granted = mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, c->pool_size);
+    if (granted < c->pool_size) {
+        mtkvcp_log("prepare capture: REQBUFS granted %d < %d", granted,
+                   c->pool_size);
+        mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
+    {
+        struct v4l2_format g;
+
+        memset(&g, 0, sizeof(g));
+        g.type = DEC_CAP_TYPE;
+        if (mtkvcp_ioctl(c->vfd, VIDIOC_G_FMT, &g) == 0) {
+            c->cap_stride = (int)g.fmt.pix_mp.plane_fmt[0].bytesperline;
+            c->cap_bh = (int)g.fmt.pix_mp.height;
+        }
+        if (c->cap_stride <= 0)
+            c->cap_stride = c->width;
+        if (c->cap_bh < c->height)
+            c->cap_bh = c->height;
+    }
+    c->cap_count = c->pool_size;
+    c->cap_mmap_count = c->pool_size;
+    for (i = 0; i < c->pool_size; i++)
+        if (mtkvcp_map_cap(c, i) < 0) {
+            mtkvcp_unmap_all(c);
+            mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
+            c->cap_count = 0;
+            c->cap_mmap_count = 0;
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+        }
+    mtkvcp_log("prepare capture: %d slots %dx%d fourcc=%#x (no streamon)",
+               c->pool_size, c->width, c->height, c->cap_fourcc);
+    return VA_STATUS_SUCCESS;
+}
+
+/* One more CAPTURE buffer, pre- or post-STREAMON. Returns its index or -1. */
+static int mtkvcp_dec_add_cap(struct mtkvcp_drv *d, int ci)
+{
+    struct mtkvcp_context *c = &d->contexts[ci];
+    struct v4l2_create_buffers cb;
+    struct v4l2_format g;
+    int idx;
+
+    if (c->cap_count >= mtkvcp_dec_max_pool(c))
+        return -1;
+    memset(&g, 0, sizeof(g));
+    g.type = DEC_CAP_TYPE;
+    if (mtkvcp_ioctl(c->vfd, VIDIOC_G_FMT, &g) < 0)
+        return -1;
+    memset(&cb, 0, sizeof(cb));
+    cb.count = 1;
+    cb.memory = V4L2_MEMORY_MMAP;
+    cb.format = g;
+    if (mtkvcp_ioctl(c->vfd, VIDIOC_CREATE_BUFS, &cb) < 0)
+        return -1;
+    idx = (int)cb.index;
+    if (idx < 0 || idx >= MTKVCP_MAX_SURFACES || idx != c->cap_count)
+        return -1;
+    if (mtkvcp_map_cap(c, idx) < 0)
+        return -1;
+    if (c->streaming && mtkvcp_qbuf_cap(c, idx) < 0)
+        return -1;
+    c->cap_count = idx + 1;
+    c->cap_mmap_count = idx + 1;
+    return idx;
+}
+
+/* Chromium's frame pool creates its surfaces and exports each one to a
+ * dma-buf *before* the first picture arrives, then decodes into those very
+ * surfaces expecting the exported objects to be the storage. A surface that
+ * is exported while still unbound therefore has to be attached to the decode
+ * context's CAPTURE pool here; otherwise the client keeps a handle on the
+ * placeholder buffer of mtkvcp_export_unbound(), which the firmware never
+ * writes - all-zero chroma, i.e. green video. Returns the slot or -1.
+ * MTK_VCP_VA_PREBIND=0 restores the old placeholder behaviour. */
+int mtkvcp_dec_attach_surface(struct mtkvcp_drv *d, int si)
+{
+    static int prebind = -1;
+    struct mtkvcp_surface *s = &d->surfaces[si];
+    struct mtkvcp_context *c;
+    int ci = -1, i, idx;
+
+    if (prebind < 0) {
+        const char *v = getenv("MTK_VCP_VA_PREBIND");
+
+        prebind = !(v && v[0] == '0');
+    }
+    if (!prebind || si < 0 || si >= MTKVCP_MAX_SURFACES)
+        return -1;
+    if (!s->in_use || s->kind != MTKVCP_SURF_UNBOUND)
+        return -1;
+    for (i = 0; i < MTKVCP_MAX_CONTEXTS; i++) {
+        c = &d->contexts[i];
+        if (!c->in_use || c->is_encode || c->is_vpp || c->vfd < 0)
+            continue;
+        /* The context follows the coded size; the client may size its pool
+         * to the visible frame, so accept anything that fits. */
+        if (s->width > c->width || s->height > c->height ||
+            s->width < MTKVCP_MIN_W || s->height < MTKVCP_MIN_H)
+            continue;
+        ci = i;
+        break;
+    }
+    if (ci < 0)
+        return -1;
+    if (mtkvcp_dec_prepare_cap(d, ci) != VA_STATUS_SUCCESS)
+        return -1;
+    c = &d->contexts[ci];
+    for (idx = 0; idx < c->cap_count; idx++)
+        if (mtkvcp_cap_slot_owner(d, ci, idx) < 0)
+            break;
+    if (idx >= c->cap_count) {
+        idx = mtkvcp_dec_add_cap(d, ci);
+        if (idx < 0) {
+            mtkvcp_log("prebind si=%d: no free CAPTURE slot (have %d)",
+                       si, c->cap_count);
+            return -1;
+        }
+    }
+    if (s->prime_fd >= 0) {
+        close(s->prime_fd);
+        s->prime_fd = -1;
+    }
+    s->ctx = ci;
+    s->kind = MTKVCP_SURF_DECODE;
+    s->cap_index = idx;
+    s->state = MTKVCP_SS_IDLE;
+    /* The client holds this slot's dma-buf: the pool must stop rotating and
+     * be fed one slot per access unit instead (see cap_ondemand). */
+    c->cap_ondemand = 1;
+    mtkvcp_log("prebind si=%d -> ctx=%d slot=%d (%dx%d, pool=%d)", si, ci,
+               idx, s->width, s->height, c->cap_count);
+    return idx;
+}
+
 /* Stream start: CAPTURE setup with the fixed pool. */
 static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
 {
     struct mtkvcp_context *c = &d->contexts[ci];
     int bound[MTKVCP_MAX_SURFACES];
-    int nbound = 0, i, r, granted;
-    size_t dummy;
+    int nbound = 0, i, r;
     VAStatus st;
     /* Before STREAMON: the driver sizes its OPP request when the first header
      * is parsed, which happens on the first access unit after this. */
@@ -473,53 +663,45 @@ static VAStatus mtkvcp_dec_stream_start(struct mtkvcp_drv *d, int ci)
     st = mtkvcp_claim_hw(d, ci);
     if (st != VA_STATUS_SUCCESS)
         return st;
-    r = mtkvcp_v4l2_s_fmt_planes(c->vfd, DEC_CAP_TYPE, c->cap_fourcc,
-                                 c->width, c->height, c->cap_planes, &dummy);
-    mtkvcp_log("CAP S_FMT -> sizeimage=%zu", dummy);
-    if (r < 0) {
-        mtkvcp_release_hw(d, ci);
-        return VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED;
-    }
-    granted = mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, c->pool_size);
-    if (granted < c->pool_size) {
-        mtkvcp_log("stream start: REQBUFS granted %d < %d", granted,
-                   c->pool_size);
-        mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
-        mtkvcp_release_hw(d, ci);
-        return VA_STATUS_ERROR_ALLOCATION_FAILED;
-    }
-    /* Real stride/buffer-height for image export (may exceed visible). */
-    {
-        struct v4l2_format g;
-        memset(&g, 0, sizeof(g));
-        g.type = DEC_CAP_TYPE;
-        if (mtkvcp_ioctl(c->vfd, VIDIOC_G_FMT, &g) == 0) {
-            c->cap_stride =
-                (int)g.fmt.pix_mp.plane_fmt[0].bytesperline;
-            c->cap_bh = (int)g.fmt.pix_mp.height;
-        }
-        if (c->cap_stride <= 0)
-            c->cap_stride = c->width;
-        if (c->cap_bh < c->height)
-            c->cap_bh = c->height;
-    }
-    c->cap_count = c->pool_size;
-    c->cap_mmap_count = c->pool_size;
-    for (i = 0; i < nbound && i < c->pool_size; i++) {
-        if (d->surfaces[bound[i]].prime_fd >= 0) {
-            close(d->surfaces[bound[i]].prime_fd);
-            d->surfaces[bound[i]].prime_fd = -1;
-        }
-        d->surfaces[bound[i]].cap_index = i;
-        d->surfaces[bound[i]].state = MTKVCP_SS_IDLE;
-    }
-    for (i = 0; i < c->pool_size; i++) {
-        if (mtkvcp_map_cap(c, i) < 0) {
-            mtkvcp_unmap_all(c);
-            mtkvcp_v4l2_reqbufs(c->vfd, DEC_CAP_TYPE, 0);
+    if (c->cap_count > 0) {
+        /* A client already exported dma-bufs out of this pool (see
+         * mtkvcp_dec_attach_surface): it must be neither freed nor
+         * renumbered, only extended to the depth this stream needs. */
+        while (c->pool_size > c->cap_count &&
+               mtkvcp_dec_add_cap(d, ci) >= 0)
+            c->pool_size = c->cap_count;
+        c->pool_size = c->cap_count;
+        mtkvcp_log("stream start: reuse prepared CAPTURE pool (%d slots, "
+                   "stride=%d bh=%d)", c->pool_size, c->cap_stride,
+                   c->cap_bh);
+    } else {
+        st = mtkvcp_dec_prepare_cap(d, ci);
+        if (st != VA_STATUS_SUCCESS) {
             mtkvcp_release_hw(d, ci);
-            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            return st;
         }
+        c->pool_size = c->cap_count;
+    }
+    for (i = 0; i < nbound; i++) {
+        struct mtkvcp_surface *s = &d->surfaces[bound[i]];
+        int k;
+
+        if (s->prime_fd >= 0) {
+            close(s->prime_fd);
+            s->prime_fd = -1;
+        }
+        /* Keep a slot the surface already owns: it may be exported. */
+        if (!(s->cap_index >= 0 && s->cap_index < c->cap_count)) {
+            for (k = 0; k < c->cap_count; k++)
+                if (mtkvcp_cap_slot_owner(d, ci, k) < 0)
+                    break;
+            s->cap_index = k < c->cap_count ? k : -1;
+        }
+        s->state = MTKVCP_SS_IDLE;
+    }
+    /* On-demand pairing: queue nothing here; each access unit queues its
+     * own target's slot in the submit path. */
+    for (i = 0; i < c->pool_size && !c->cap_ondemand; i++) {
         r = mtkvcp_qbuf_cap(c, i);
         if (r < 0) {
             mtkvcp_unmap_all(c);
@@ -636,6 +818,13 @@ VAStatus mtkvcp_dec_begin(struct mtkvcp_drv *d, int ci, int si)
         if (!c->streaming || s->cap_index < 0) {
             mtkvcp_log("recycle si=%d: no buffer (streaming=%d cap=%d), "
                        "dropped", si, c->streaming, s->cap_index);
+            s->state = MTKVCP_SS_IDLE;
+        } else if (c->cap_ondemand) {
+            /* The slot is queued again by the submit path, right before
+             * this surface's next access unit: queueing it twice would
+             * rotate the pool away from the exported dma-bufs. */
+            mtkvcp_log("recycle si=%d buf=%d (on-demand: queued at submit)",
+                       si, s->cap_index);
             s->state = MTKVCP_SS_IDLE;
         } else {
             mtkvcp_log("recycle si=%d buf=%d back to driver", si,
@@ -913,9 +1102,27 @@ static int mtkvcp_dec_renegotiate(struct mtkvcp_drv *d, int ci)
     }
     ev_stride = (int)g.fmt.pix_mp.plane_fmt[0].bytesperline;
     ev_bh = (int)g.fmt.pix_mp.height;
-    if (c->cap_count == c->pool_size &&
-        c->cap_mmap_count == c->pool_size &&
-        ev_stride == c->cap_stride && ev_bh == c->cap_bh) {
+    mtkvcp_log("renegotiate: have stride=%d bh=%d count=%d/%d ondemand=%d, "
+               "event stride=%d bh=%d", c->cap_stride, c->cap_bh,
+               c->cap_count, c->pool_size, c->cap_ondemand, ev_stride, ev_bh);
+    /* The buffers were allocated from this very geometry: the kernel reports
+     * the requested height back through G_FMT but rounds every buffer up to
+     * 32 lines, so an event that matches the rounded height is the same pool. */
+    if (ev_stride == c->cap_stride &&
+        ev_bh == ((c->cap_bh + 31) & ~31) &&
+        (c->cap_ondemand ||
+         (c->cap_count == c->pool_size &&
+          c->cap_mmap_count == c->pool_size))) {
+        if (c->cap_ondemand) {
+            /* The client holds one dma-buf per slot, and the pairing
+             * between access units and slots comes from the order the
+             * queue was fed in: neither restarting CAPTURE nor requeueing
+             * the pool is allowed here. The buffers were allocated from
+             * this very geometry, so there is nothing to renegotiate. */
+            mtkvcp_log("renegotiate: geometry unchanged (stride=%d bh=%d), "
+                       "pre-bound pool kept", ev_stride, ev_bh);
+            return 0;
+        }
         mtkvcp_log("renegotiate: geometry unchanged (%dx%d stride=%d), "
                    "restart CAPTURE", ev_bh, ev_stride, ev_stride);
         mtkvcp_v4l2_stream(c->vfd, DEC_CAP_TYPE, 0);
@@ -1132,8 +1339,8 @@ static int mtkvcp_complete_cap(struct mtkvcp_drv *d, int ci,
      * holds - measured as all-zero for a stream whose frames demonstrably
      * contain data. Any buffer-content probe has to go through the same
      * path the client uses. */
-    mtkvcp_log("complete seq=%llu -> target s%d buf=%d",
-               (unsigned long long)seq, si_target + 1, idx);
+    mtkvcp_log("complete seq=%llu -> target s%d buf=%d (owned %d)",
+               (unsigned long long)seq, si_target + 1, idx, old_cap);
     return 1;
 }
 
@@ -2134,6 +2341,23 @@ static VAStatus mtkvcp_dec_submit_au(struct mtkvcp_drv *d, int ci)
     if (c->out_fourcc == V4L2_PIX_FMT_MPEG2)
         mtkvcp_log("mp2 submit: target=%d au_len=%zu nslices=%d temp=?",
                    c->au_target, c->au_len, c->nslices);
+    /* On-demand pairing: hand the target's own CAPTURE slot to the driver
+     * immediately before this access unit, so V4L2 pairs the two and the
+     * firmware writes the picture into the buffer the client exported for
+     * this surface. */
+    if (c->cap_ondemand && c->au_target >= 0) {
+        int cslot = d->surfaces[c->au_target].cap_index;
+
+        if (cslot >= 0 && cslot < c->cap_count) {
+            if (mtkvcp_qbuf_cap(c, cslot) < 0)
+                mtkvcp_log("on-demand: target s%d slot=%d qbuf failed",
+                           c->au_target + 1, cslot);
+            else if (c->cap_queued != 1)
+                mtkvcp_log("on-demand: %d CAPTURE queued before AU (target "
+                           "s%d slot=%d)", c->cap_queued, c->au_target + 1,
+                           cslot);
+        }
+    }
     r = mtkvcp_ioctl(c->vfd, VIDIOC_QBUF, &b);
     if (r < 0) {
         mtkvcp_log("OUT QBUF failed errno=%d (slot=%d known-free=%d)", r,
